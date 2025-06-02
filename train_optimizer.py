@@ -23,7 +23,7 @@ def main():
             for file in Path(path).rglob("*.csv"):
                 if "train" in file.name.lower():
                     shutil.copy(file, dataset_path)
-                    print(f"✅ Dataset saved to {dataset_path}")
+                    print(f"Dataset saved to {dataset_path}")
                     break
         except Exception as e:
             print(f"❌ Error: {e}")
@@ -34,10 +34,9 @@ def main():
     optimizer = CreditScoreOptimizer()
     optimizer.train(dataset_path)
     
-    # Save model
     optimizer.save_model()
     
-    print("\n✅ Training complete! You can now run app.py")
+    print("\nTraining complete! You can now run app.py")
 
 if __name__ == "__main__":
     main()

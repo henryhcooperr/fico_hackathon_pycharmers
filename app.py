@@ -7,13 +7,7 @@ from credit_score_optimizer import CreditScoreOptimizer
 import json
 
 def get_user_input():
-    """Get user financial information"""
-    print("\n" + "="*60)
-    print("💳 CREDIT SCORE OPTIMIZER - Better than CreditKarma")
-    print("="*60)
-    
-    print("\n📊 Enter Your Financial Information:")
-    print("(We'll tell you EXACTLY what to do to improve your score)\n")
+
     
     # Get current score
     while True:
@@ -79,23 +73,19 @@ def get_user_input():
     return current_score, user_data
 
 def display_recommendations(results):
-    """Display recommendations in a user-friendly way"""
-    print("\n" + "="*60)
-    print(f"📊 YOUR PERSONALIZED CREDIT IMPROVEMENT PLAN")
-    print("="*60)
-    
-    print(f"\n💳 Current Credit Score: {results['current_score']}")
+    print(f"📊 YOUR PERSONALIZED CREDIT IMPROVEMENT PLAN"))
+    print(f"\nCurrent Credit Score: {results['current_score']}")
     
     # Quick wins
     if results['quick_wins']:
-        print("\n🚀 QUICK WINS (Easy changes with immediate impact):")
+        print("QUICK WINS (Easy changes with immediate impact):")
         for i, rec in enumerate(results['quick_wins'], 1):
             print(f"\n{i}. {rec['specific_action']}")
             print(f"   📈 Expected Improvement: +{rec['predicted_improvement']} points")
     
     # High impact
     if results['high_impact']:
-        print("\n💪 HIGH IMPACT ACTIONS (Bigger effort, bigger rewards):")
+        print("\nHIGH IMPACT ACTIONS (Bigger effort, bigger rewards):")
         for i, rec in enumerate(results['high_impact'], 1):
             if rec not in results['quick_wins']:
                 print(f"\n{i}. {rec['specific_action']}")
@@ -123,25 +113,25 @@ def main():
     try:
         optimizer.load_model()
     except:
-        print("❌ No trained model found. Please run train_optimizer.py first!")
+        print("XXX No trained model found. Please run train_optimizer.py first!")
         return
     
     # Get user input
     current_score, user_data = get_user_input()
     
     # Get recommendations
-    print("\n⏳ Analyzing your profile and running simulations...")
+    print("\nAnalyzing your profile and running simulations...")
     results = optimizer.get_recommendations(user_data, current_score)
     
     # Display results
     display_recommendations(results)
     
     # Save results option
-    save = input("\n💾 Save your personalized plan? (y/n): ").lower()
+    save = input("\nSave your personalized plan? (y/n): ").lower()
     if save == 'y':
         with open('my_credit_improvement_plan.json', 'w') as f:
             json.dump(results, f, indent=2)
-        print("✅ Plan saved to 'my_credit_improvement_plan.json'")
+        print("Plan saved to 'my_credit_improvement_plan.json'")
     
     print("\n✨ Good luck improving your credit score!")
 
