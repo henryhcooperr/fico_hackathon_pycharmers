@@ -55,17 +55,18 @@ def extract_number(text):
 
 #  User questions
 field_questions = {
-    "Annual_Income": "How much money do you make per year before taxes?",
-    "Outstanding_Debt": "How much total money do you owe right now (loans, credit cards, etc)?",
     "Credit_Utilization_Ratio": "Roughly what percent of your credit are you using? Like 10%, 30%, or more?",
-    "Num_Credit_Card": "How many credit cards do you currently have?",
     "Num_of_Delayed_Payment": "How many times have you missed a payment?",
-    "Num_Credit_Inquiries": "How many times did you apply for credit in the last year?",
-    "Monthly_Balance": "How much do you usually owe across all accounts monthly?",
-    "Amount_invested_monthly": "How much do you usually save or invest each month?",
     "Credit_History_Age": "How many years have you had credit (any loans or cards)?",
-    "Total_EMI_per_month": "How much do you pay monthly on all loans and cards combined?"
+    "Outstanding_Debt": "How much total money do you owe right now (loans, credit cards, etc)?",
+    "Total_EMI_per_month": "How much do you pay monthly on all loans and cards combined?",
+    "Num_Credit_Inquiries": "How many times did you apply for credit in the last year?",
+    "Num_Credit_Card": "How many credit cards do you currently have?",
+    "Monthly_Balance": "How much do you usually owe across all accounts monthly?",
+    "Annual_Income": "How much money do you make per year before taxes?",
+    "Amount_invested_monthly": "How much do you usually save or invest each month?"
 }
+
 
 # Predict + get suggestions
 def run_credit_optimizer(user_data):
