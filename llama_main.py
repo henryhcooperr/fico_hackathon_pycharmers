@@ -1,20 +1,16 @@
 import pickle
 import pandas as pd
-import numpy as np
 import requests
 import re
-
 
 # Load the trained model
 with open("credit_optimizer_model.pkl", "rb") as f:
     model_data = pickle.load(f)
 
-
 preprocessor = model_data["preprocessor"]
 score_model = model_data["score_model"]
 
-
-# Initial system message for LLaMA
+# system prompt for LLaMA
 conversation_history = [
     {
         "role": "system",
@@ -25,44 +21,36 @@ conversation_history = [
     }
 ]
 
-
-# Call local LLaMA server
 def ask_llama(prompt):
     conversation_history.append({"role": "user", "content": prompt})
-    url = "http://localhost:11434/api/chat"  # ← CHANGE THIS LINE
+    url = "http://localhost:8011/api/chat"
     headers = {"Content-Type": "application/json"}
     payload = {
-        "model": "llama3",  # Make sure this matches what you pulled
+        "model": "llama3",
         "messages": conversation_history,
-        "stream": False  # ← ADD THIS (Ollama uses different format)
+        "stream": False
     }
     try:
         response = requests.post(url, headers=headers, json=payload)
         response.raise_for_status()
-        reply = response.json()["message"]["content"].strip()  # ← CHANGE THIS TOO
+        reply = response.json()["choices"][0]["message"]["content"].strip()
         conversation_history.append({"role": "assistant", "content": reply})
         return reply
-    except Exception as e:
-        return f"🛑 LLaMA error: {e}"
+    except Exception:
+        return "LLaMA error: unable to connect to server."
 
-# yes/no
 def extract_number(text, field_name=None):
-    """Extract numbers with context awareness"""
     text = text.lower().strip()
-    
-    # Handle field-specific logic
+
     if field_name == "Credit_Utilization_Ratio":
-        # Handle percentage inputs (30%, 30 percent, etc.)
         percent_match = re.search(r'(\d+\.?\d*)\s*(?:%|percent)', text)
         if percent_match:
-            return float(percent_match.group(1)) / 100 if float(percent_match.group(1)) > 1 else float(percent_match.group(1))
-        # If they just say a number for utilization, assume it's a percentage
-        simple_num = re.search(r'^(\d+)$', text.strip())
-        if simple_num:
-            num = float(simple_num.group(1))
-            return num / 100 if num > 1 else num
-    
-    # For payment/inquiry fields, handle common responses
+            val = float(percent_match.group(1))
+            return val / 100 if val > 1 else val
+        if re.fullmatch(r'\d+', text):
+            val = float(text)
+            return val / 100 if val > 1 else val
+
     if field_name in ["Num_of_Delayed_Payment", "Num_Credit_Inquiries"]:
         if any(word in text for word in ["no", "none", "zero", "never", "0"]):
             return 0.0
@@ -71,30 +59,20 @@ def extract_number(text, field_name=None):
         if "twice" in text or "two" in text or "2" in text:
             return 2.0
         if "few" in text:
-            return 3.0  # Assume "few" means 3
-    
-    # Handle income/debt with k/m notation
+            return 3.0
+
     text_clean = text.replace("$", "").replace(",", "")
-    
-    # Check for thousands (50k, 50K, 50 thousand)
     k_match = re.search(r'(\d+\.?\d*)\s*(?:k|thousand)', text_clean, re.IGNORECASE)
     if k_match:
         return float(k_match.group(1)) * 1000
-    
-    # Check for millions (1.5m, 2 million)
     m_match = re.search(r'(\d+\.?\d*)\s*(?:m|million)', text_clean, re.IGNORECASE)
     if m_match:
         return float(m_match.group(1)) * 1000000
-    
-    # Standard number extraction
     numbers = re.findall(r'\d+\.?\d*', text_clean)
     if numbers:
         return float(numbers[0])
-    
     return None
 
-
-# Questions ordered by credit importance
 field_questions = {
     "Credit_Utilization_Ratio": "What percent of your available credit are you currently using? (e.g., 10%, 30%)",
     "Num_of_Delayed_Payment": "Roughly how many times have you missed a payment in the past?",
@@ -108,52 +86,50 @@ field_questions = {
     "Amount_invested_monthly": "How much money do you usually save or invest monthly?"
 }
 
-
-# Run prediction and offer suggestions
 def run_credit_optimizer(user_data):
-    print("\n Analyzing your responses...\n")
+    print("\nAnalyzing your responses...\n")
     X_input = preprocessor.transform(pd.DataFrame([user_data]))
     prediction = score_model.predict(X_input)[0]
+    print(f"Estimated Credit Score: {int(prediction)}")
 
-
-    print(f" Estimated Credit Score: {int(prediction)}")
-
-
-    improve_prompt = (
+    print("\nBasic Tips:")
+    print(ask_llama(
         f"The user has this credit profile: {user_data}. Their estimated credit score is {int(prediction)}. "
-        f"Give 3 helpful ways to improve it in a friendly tone."
-    )
-    print("\n LLaMA Suggestions:\n" + ask_llama(improve_prompt))
+        f"List 3 basic ways they can improve their credit score. Be friendly and clear."
+    ))
 
-
-    more = input("\nWould you like additional tips to manage money or maintain your score? (yes/no): ").strip().lower()
+    more = input("\nWould you like more advanced financial tips? (yes/no): ").strip().lower()
     if more in ["yes", "y"]:
-        advice_prompt = (
+        conversation_history.clear()
+        conversation_history.append({
+            "role": "system",
+            "content": (
+                "You are a helpful financial assistant. Based on the user's credit profile and score, give 3 specific advanced personal finance tips. "
+                "Do NOT ask the user any questions — just provide guidance."
+            )
+        })
+        print("\nAdvanced Tips:")
+        print(ask_llama(
             f"The user has this credit profile: {user_data}. Their estimated score is {int(prediction)}. "
-            f"Give some bonus personal finance tips, even if the score is good."
-        )
-        print("\n More Tips:\n" + ask_llama(advice_prompt))
+            f"Provide 3 advanced financial strategies tailored to this profile."
+        ))
     else:
-        print(" Got it! Wishing you financial success!")
+        print("Thank you. Wishing you financial success!")
 
-
-# Main Q&A Loop
 def main():
-    print("\n Welcome to the LLaMA Credit Score Assistant!")
+    print("\nWelcome to the LLaMA Credit Score Assistant!")
     print("Answer a few friendly questions to get a credit score estimate.")
     print("Type 'skip' to skip or 'exit' to quit.\n")
-
 
     user_data = {}
     for field, question in field_questions.items():
         retry = 0
         while retry < 2:
-            print(f"\n {question}")
+            print(f"\n{question}")
             user_input = input("You: ").strip()
 
-
             if user_input.lower() in ["exit", "quit"]:
-                print(" Goodbye!")
+                print("Goodbye!")
                 return
             if user_input.lower() in ["skip", "s"]:
                 break
@@ -166,16 +142,14 @@ def main():
                 retry += 1
                 if retry == 1:
                     clarification = ask_llama(f"Can you rephrase this question for someone who didn't understand: '{question}'")
-                    print(f"\n {clarification}")
+                    print(f"\n{clarification}")
                 else:
-                    print(" Skipping this one.")
-
+                    print("Skipping this one.")
 
     if len(user_data) >= 5:
         run_credit_optimizer(user_data)
     else:
         print("Not enough responses to make a prediction.")
-
 
 if __name__ == "__main__":
     main()
