@@ -26,32 +26,69 @@ conversation_history = [
 #  Ask LLaMA with memory
 def ask_llama(prompt):
     conversation_history.append({"role": "user", "content": prompt})
-    url = "http://localhost:8011/v1/chat/completions"
+    url = "http://localhost:11434/api/chat"  # ← CHANGE THIS LINE
     headers = {"Content-Type": "application/json"}
     payload = {
+        "model": "llama3",  # Make sure this matches what you pulled
         "messages": conversation_history,
-        "temperature": 0.7,
-        "max_tokens": 250
+        "stream": False  # ← ADD THIS (Ollama uses different format)
     }
-
+    
     try:
         response = requests.post(url, headers=headers, json=payload)
         response.raise_for_status()
-        reply = response.json()["choices"][0]["message"]["content"].strip()
+        reply = response.json()["message"]["content"].strip()  # ← CHANGE THIS TOO
         conversation_history.append({"role": "assistant", "content": reply})
         return reply
     except Exception as e:
         return f"🛑 LLaMA error: {e}"
-
 # yes/no
-def extract_number(text):
-    text = text.lower()
-    if "yes" in text:
-        return 1.0
-    elif "no" in text:
-        return 0.0
-    nums = re.findall(r"[\d,.]+", text.replace(",", ""))
-    return float(nums[0]) if nums else None
+def extract_number(text, field_name=None):
+    """Extract numbers with context awareness"""
+    text = text.lower().strip()
+    
+    # Handle field-specific logic
+    if field_name == "Credit_Utilization_Ratio":
+        # Handle percentage inputs (30%, 30 percent, etc.)
+        percent_match = re.search(r'(\d+\.?\d*)\s*(?:%|percent)', text)
+        if percent_match:
+            return float(percent_match.group(1)) / 100 if float(percent_match.group(1)) > 1 else float(percent_match.group(1))
+        # If they just say a number for utilization, assume it's a percentage
+        simple_num = re.search(r'^(\d+)$', text.strip())
+        if simple_num:
+            num = float(simple_num.group(1))
+            return num / 100 if num > 1 else num
+    
+    # For payment/inquiry fields, handle common responses
+    if field_name in ["Num_of_Delayed_Payment", "Num_Credit_Inquiries"]:
+        if any(word in text for word in ["no", "none", "zero", "never", "0"]):
+            return 0.0
+        if "once" in text or "one" in text or "1" in text:
+            return 1.0
+        if "twice" in text or "two" in text or "2" in text:
+            return 2.0
+        if "few" in text:
+            return 3.0  # Assume "few" means 3
+    
+    # Handle income/debt with k/m notation
+    text_clean = text.replace("$", "").replace(",", "")
+    
+    # Check for thousands (50k, 50K, 50 thousand)
+    k_match = re.search(r'(\d+\.?\d*)\s*(?:k|thousand)', text_clean, re.IGNORECASE)
+    if k_match:
+        return float(k_match.group(1)) * 1000
+    
+    # Check for millions (1.5m, 2 million)
+    m_match = re.search(r'(\d+\.?\d*)\s*(?:m|million)', text_clean, re.IGNORECASE)
+    if m_match:
+        return float(m_match.group(1)) * 1000000
+    
+    # Standard number extraction
+    numbers = re.findall(r'\d+\.?\d*', text_clean)
+    if numbers:
+        return float(numbers[0])
+    
+    return None
 
 #  User questions
 field_questions = {
@@ -114,7 +151,7 @@ def main():
             if user_input.lower() in ["skip", "s"]:
                 break
 
-            val = extract_number(user_input)
+            val = extract_number(user_input, field_name=field)
             if val is not None:
                 user_data[field] = val
                 asked_fields.append(field)
