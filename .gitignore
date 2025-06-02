@@ -1,0 +1,4 @@
+*.pkl
+credit_optimizer_model.pkl
+__pycache__/
+venv/
