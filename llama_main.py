@@ -11,7 +11,7 @@ with open("credit_optimizer_model.pkl", "rb") as f:
 preprocessor = model_data["preprocessor"]
 score_model = model_data["score_model"]
 
-# 🧠LLaMA memory
+# LLaMA memory
 conversation_history = [
     {
         "role": "system",
@@ -73,7 +73,7 @@ def run_credit_optimizer(user_data):
     X_input = preprocessor.transform(pd.DataFrame([user_data]))
     prediction = score_model.predict(X_input)[0]
 
-    print(f"\n💳 Estimated Credit Score: {int(prediction)}")
+    print(f"\n Estimated Credit Score: {int(prediction)}")
 
     improvement_prompt = (
         f"The user has this credit profile: {user_data}. Their estimated credit score is {int(prediction)}. "
