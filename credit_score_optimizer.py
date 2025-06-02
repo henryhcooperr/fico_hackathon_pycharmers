@@ -258,7 +258,7 @@ class CreditScoreOptimizer:
         print("\nCalculating feature impacts...")
         self._calculate_feature_impacts(X_train, train_df)
         
-        print("\n✅ Training complete!")
+        print("\nTraining complete!")
         
         # Optional: Return metrics for logging
         return {
@@ -354,7 +354,7 @@ class CreditScoreOptimizer:
         # Predict current score if not provided
         if current_score is None:
             current_score = int(self.score_model.predict(user_processed)[0])
-        print(f"Current estimated credit score: {current_score}")
+
         # Run what-if scenarios
         recommendations = []
         
@@ -630,37 +630,78 @@ class CreditScoreOptimizer:
         """Generate scenarios combining multiple changes"""
         combo_recs = []
         
-        # Try combining top 2-3 recommendations
+        # Create a copy of the processed data to apply changes
         test_data = user_processed.copy()
         total_effort = 0
         changes = []
+        applied_changes = {}
         
+        # Iterate through top recommendations and apply changes
         for rec in top_recs[:3]:
             feature = rec['feature']
-            if feature in self.preprocessor.feature_columns:
-                feature_idx = self.preprocessor.feature_columns.index(feature)
-                scaled_value = self.preprocessor.scalers[feature].transform([[rec['target_value']]])[0][0]
-                test_data.iloc[0, feature_idx] = scaled_value
-                total_effort += rec['effort_score']
-                changes.append(f"{feature}: {rec['current_value']:.1f} → {rec['target_value']:.1f}")
-        
-        # Predict combined improvement
-        new_score = int(self.score_model.predict(test_data)[0])
-        improvement = new_score - current_score
-        
-        if improvement > sum(r['predicted_improvement'] for r in top_recs[:3]) * 0.7:
-            combo_recs.append({
-                'feature': 'Combined Actions',
-                'current_value': 'Multiple factors',
-                'target_value': 'Optimized values',
-                'change_amount': 'Multiple changes',
-                'predicted_improvement': improvement,
-                'effort_score': total_effort / len(top_recs[:3]),
-                'specific_action': f"Combine these actions for maximum impact (+{improvement} points total):\n" + 
-                                 "\n".join(f"• {change}" for change in changes),
-                'importance': 1.0
-            })
             
+            # Check if feature exists in the processed data
+            if feature not in test_data.columns:
+                print(f"Warning: Feature '{feature}' not found in processed data")
+                continue
+                
+            # Store the changes to apply
+            applied_changes[feature] = rec['target_value']
+            total_effort += rec['effort_score']
+            changes.append(f"{feature}: {rec['current_value']:.1f} → {rec['target_value']:.1f}")
+        
+        # If we have valid changes to apply
+        if applied_changes:
+            # Create a copy of the original user data for transformation
+            modified_user_data = user_data.copy()
+            
+            # Apply all changes to the original data
+            for feature, target_value in applied_changes.items():
+                if feature in modified_user_data.columns:
+                    modified_user_data[feature] = target_value
+            
+            # Re-process the entire modified data through the preprocessor
+            try:
+                test_data_transformed = self.preprocessor.transform(modified_user_data)
+                
+                # If transform returns numpy array, convert back to DataFrame
+                if isinstance(test_data_transformed, np.ndarray):
+                    test_data_transformed = pd.DataFrame(
+                        test_data_transformed, 
+                        columns=user_processed.columns
+                    )
+            except Exception as e:
+                print(f"Error transforming combined data: {e}")
+                return combo_recs
+            
+            try:
+                new_score = int(self.score_model.predict(test_data_transformed)[0])
+                improvement = new_score - current_score
+                
+                # Calculate expected improvement (sum of individual improvements)
+                expected_improvement = sum(r['predicted_improvement'] for r in top_recs[:len(applied_changes)])
+                
+                # Only recommend if combination provides significant benefit
+                # (more than 80% of sum of individual improvements suggests synergy)
+                if improvement > expected_improvement * 0.8:
+                    avg_effort = total_effort / len(applied_changes) if applied_changes else 0
+                    
+                    combo_recs.append({
+                        'feature': 'Combined Actions',
+                        'current_value': 'Multiple factors',
+                        'target_value': 'Optimized values',
+                        'change_amount': f'{len(applied_changes)} changes',
+                        'predicted_improvement': improvement,
+                        'effort_score': avg_effort,
+                        'specific_action': f"Combine these actions for maximum impact (+{improvement} points total):\n" + 
+                                        "\n".join(f"• {change}" for change in changes),
+                        'importance': 1.0,
+                        'synergy_bonus': improvement - expected_improvement  # Track how much extra benefit
+                    })
+                    
+            except Exception as e:
+                print(f"Error predicting combined score: {e}")
+        
         return combo_recs
     
     def save_model(self, filepath='credit_optimizer_model.pkl'):
