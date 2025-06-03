@@ -116,6 +116,27 @@ def run_credit_optimizer(user_data):
     else:
         print("Thank you. Wishing you financial success!")
 
+    explain_score(user_data)
+        
+def explain_score(user_data):
+        print("\nFeatures Impact on Your Scores")
+        baseline_data = pd.DataFrame([user_data])
+        default_input = preprocessor.transform(baseline_data)
+        original_score = score_model.predict(default_input)[0]
+    
+        for field in user_data:
+            modified_data = user_data.copy()
+            if isinstance(modified_data[field], (int, float)):
+                modified_data[field] = modified_data[field] * 1.1 if modified_data[field] != 0 else 1
+            else:
+                continue 
+    
+            test_input = preprocessor.transform(pd.DataFrame([modified_data]))
+            modified_score = score_model.predict(test_input)[0]
+            delta = modified_score - original_score
+            direction = "increased" if delta > 0 else "decreased"
+            print(f"- {field.replace('_',' ')} {direction} your score by {abs(delta):.1f} points")
+
 def main():
     print("\nWelcome to the LLaMA Credit Score Assistant!")
     print("Answer a few friendly questions to get a credit score estimate.")
