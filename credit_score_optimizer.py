@@ -7,9 +7,11 @@ import pandas as pd
 import numpy as np
 import pickle
 from pathlib import Path
-from sklearn.ensemble import RandomForestRegressor, RandomForestClassifier
+import xgboost as xgb
+from sklearn.ensemble import RandomForestClassifier
 from sklearn.preprocessing import StandardScaler, LabelEncoder
-from sklearn.model_selection import train_test_split
+from sklearn.model_selection import train_test_split, cross_val_score, GridSearchCV, RandomizedSearchCV
+from sklearn.metrics import mean_absolute_error, r2_score, accuracy_score, classification_report
 import warnings
 warnings.filterwarnings('ignore')
 
@@ -171,137 +173,458 @@ class CreditScoreOptimizer:
         
     def train(self, dataset_path):
         """Train with customer-based split to prevent data leakage"""
-        print("🚀 Training Credit Score Optimizer...")
+        print("🚀 Training Credit Score Optimizer with XGBoost...")
         
         # Load data
         df = pd.read_csv(dataset_path)
+        print(f"\n📊 Loaded dataset shape: {df.shape}")
+        print(f"Columns: {list(df.columns)}")
+        
+        # Inspect Credit_Score column
+        if 'Credit_Score' in df.columns:
+            print(f"\nCredit_Score value counts:")
+            print(df['Credit_Score'].value_counts())
+            print(f"Credit_Score unique values: {df['Credit_Score'].unique()}")
+            print(f"Credit_Score data type: {df['Credit_Score'].dtype}")
+            print(f"Sample Credit_Score values: {df['Credit_Score'].head(10).tolist()}")
+        else:
+            print("\n⚠️ WARNING: 'Credit_Score' column not found!")
+            print(f"Available columns: {list(df.columns)}")
+        
+        # Remove duplicate rows
+        initial_rows = len(df)
+        df = df.drop_duplicates()
+        print(f"\nRemoved {initial_rows - len(df)} duplicate rows")
         
         # IMPORTANT: Split by customer BEFORE dropping Customer_ID
         unique_customers = df['Customer_ID'].unique()
         print(f"Total unique customers: {len(unique_customers)}")
         
-        # Split customers 80/20
-        from sklearn.model_selection import train_test_split
-        train_customers, test_customers = train_test_split(
+        # Split customers 70/15/15 for train/val/test
+        train_customers, temp_customers = train_test_split(
             unique_customers, 
-            test_size=0.2, 
+            test_size=0.3, 
+            random_state=42
+        )
+        val_customers, test_customers = train_test_split(
+            temp_customers,
+            test_size=0.5,
             random_state=42
         )
         
-        # Create train/test sets ensuring no customer appears in both
+        # Create train/val/test sets ensuring no customer appears in multiple sets
         train_df = df[df['Customer_ID'].isin(train_customers)].copy()
+        val_df = df[df['Customer_ID'].isin(val_customers)].copy()
         test_df = df[df['Customer_ID'].isin(test_customers)].copy()
         
         print(f"Train: {len(train_customers)} customers, {len(train_df)} records")
+        print(f"Val: {len(val_customers)} customers, {len(val_df)} records")
         print(f"Test: {len(test_customers)} customers, {len(test_df)} records")
         
-        train_df = self._prepare_training_data(train_df)
-        test_df = self._prepare_training_data(test_df)
-        
-        
-        print(f"Training set size: {len(train_df)}")
-        print(f"Test set size: {len(test_df)}")
+        # Prepare data - pass the dataset path for diagnostics
+        self.dataset_path = dataset_path
+        train_df = self._prepare_training_data(train_df.copy())
+        val_df = self._prepare_training_data(val_df.copy())
+        test_df = self._prepare_training_data(test_df.copy())
         
         # Fit preprocessor ONLY on training data
         self.preprocessor.fit(train_df)
         
-        # Transform both sets
+        # Transform all sets
         X_train = self.preprocessor.transform(train_df)
+        X_val = self.preprocessor.transform(val_df)
         X_test = self.preprocessor.transform(test_df)
         
         # Create numeric scores from categories
         score_map = {'Poor': 450, 'Standard': 650, 'Good': 780}
         y_train_numeric = train_df['Credit_Score'].map(score_map)
+        y_val_numeric = val_df['Credit_Score'].map(score_map)
         y_test_numeric = test_df['Credit_Score'].map(score_map)
         y_train_category = train_df['Credit_Score']
+        y_val_category = val_df['Credit_Score']
         y_test_category = test_df['Credit_Score']
         
-        # Train score prediction model
-        print("\nTraining score prediction model...")
-        self.score_model = RandomForestRegressor(n_estimators=100, random_state=42)
+        # Train XGBoost model with hyperparameter tuning
+        print("\nTraining XGBoost score prediction model with hyperparameter tuning...")
+        
+        # XGBoost parameters for strong regularization
+        xgb_params = {
+            'max_depth': [3, 4, 5, 6],
+            'min_child_weight': [3, 5, 7],
+            'gamma': [0.1, 0.2, 0.3],
+            'subsample': [0.6, 0.7, 0.8],
+            'colsample_bytree': [0.6, 0.7, 0.8],
+            'reg_alpha': [0.01, 0.1, 0.5],
+            'reg_lambda': [1, 1.5, 2],
+            'n_estimators': [100, 150],
+            'learning_rate': [0.01, 0.05, 0.1]
+        }
+        
+        xgb_model = xgb.XGBRegressor(
+            random_state=42, 
+            objective='reg:squarederror',
+            eval_metric='rmse'
+        )
+        
+        # Use RandomizedSearchCV for efficiency
+        xgb_search = RandomizedSearchCV(
+            xgb_model, 
+            xgb_params, 
+            n_iter=30,
+            cv=5,
+            scoring='neg_mean_absolute_error',
+            n_jobs=-1,
+            random_state=42,
+            verbose=0  # Reduce verbosity
+        )
+        
+        # Fit with cross-validation (no early stopping during CV)
+        xgb_search.fit(X_train, y_train_numeric)
+        
+        # Get best parameters
+        best_params = xgb_search.best_params_
+        print(f"\nBest XGBoost parameters:")
+        for param, value in best_params.items():
+            print(f"  {param}: {value}")
+        
+        # Create final model without early stopping to avoid version issues
+        print("\nTraining final model...")
+        self.score_model = xgb.XGBRegressor(
+            **best_params,
+            random_state=42,
+            objective='reg:squarederror',
+            eval_metric='rmse'
+        )
+        
+        # Fit final model
         self.score_model.fit(X_train, y_train_numeric)
         
-        # Evaluate regression model
-        from sklearn.metrics import mean_absolute_error, r2_score
+        # Evaluate regression model on all sets
         train_pred = self.score_model.predict(X_train)
+        val_pred = self.score_model.predict(X_val)
         test_pred = self.score_model.predict(X_test)
         
-        print(f"Score Model - Train MAE: {mean_absolute_error(y_train_numeric, train_pred):.2f}")
-        print(f"Score Model - Test MAE: {mean_absolute_error(y_test_numeric, test_pred):.2f}")
-        print(f"Score Model - Test R²: {r2_score(y_test_numeric, test_pred):.3f}")
+        print("\n📊 Score Model Performance:")
+        print(f"Train MAE: {mean_absolute_error(y_train_numeric, train_pred):.2f}")
+        print(f"Val MAE: {mean_absolute_error(y_val_numeric, val_pred):.2f}")
+        print(f"Test MAE: {mean_absolute_error(y_test_numeric, test_pred):.2f}")
+        print(f"Train R²: {r2_score(y_train_numeric, train_pred):.3f}")
+        print(f"Val R²: {r2_score(y_val_numeric, val_pred):.3f}")
+        print(f"Test R²: {r2_score(y_test_numeric, test_pred):.3f}")
         
-        # Train category model
-        print("\nTraining category classification model...")
-        self.category_model = RandomForestClassifier(n_estimators=100, random_state=42)
-        self.category_model.fit(X_train, y_train_category)
+        # Train XGBoost classifier for categories
+        print("\n🎯 Training XGBoost category classification model...")
+        
+        xgb_clf_params = {
+            'max_depth': [3, 4, 5],
+            'min_child_weight': [3, 5],
+            'gamma': [0.1, 0.2],
+            'subsample': [0.7, 0.8],
+            'colsample_bytree': [0.7, 0.8],
+            'n_estimators': [100, 150],
+            'learning_rate': [0.05, 0.1]
+        }
+        
+        # Map categories to numeric for XGBoost classifier
+        category_map = {'Poor': 0, 'Standard': 1, 'Good': 2}
+        y_train_cat_numeric = y_train_category.map(category_map)
+        y_val_cat_numeric = y_val_category.map(category_map)
+        y_test_cat_numeric = y_test_category.map(category_map)
+        
+        xgb_clf = xgb.XGBClassifier(
+            random_state=42,
+            objective='multi:softprob',
+            num_class=3,
+            eval_metric='mlogloss'
+        )
+        
+        clf_search = GridSearchCV(
+            xgb_clf,
+            xgb_clf_params,
+            cv=3,
+            scoring='accuracy',
+            n_jobs=-1,
+            verbose=0  # Reduce verbosity
+        )
+        
+        clf_search.fit(X_train, y_train_cat_numeric)
+        
+        # Get best parameters
+        best_clf_params = clf_search.best_params_
+        print(f"\nBest classifier parameters:")
+        for param, value in best_clf_params.items():
+            print(f"  {param}: {value}")
+        
+        # Create final classifier without early stopping to avoid version issues
+        print("Training final classifier...")
+        self.category_model = xgb.XGBClassifier(
+            **best_clf_params,
+            random_state=42,
+            objective='multi:softprob',
+            num_class=3,
+            eval_metric='mlogloss'
+        )
+        
+        # Fit final classifier
+        self.category_model.fit(X_train, y_train_cat_numeric)
         
         # Evaluate classification model
-        from sklearn.metrics import classification_report, accuracy_score
         train_cat_pred = self.category_model.predict(X_train)
+        val_cat_pred = self.category_model.predict(X_val)
         test_cat_pred = self.category_model.predict(X_test)
         
-        print(f"Category Model - Train Accuracy: {accuracy_score(y_train_category, train_cat_pred):.3f}")
-        print(f"Category Model - Test Accuracy: {accuracy_score(y_test_category, test_cat_pred):.3f}")
-        print("\nClassification Report (Test Set):")
-        print(classification_report(y_test_category, test_cat_pred))
+        # Convert predictions back to original labels
+        inv_category_map = {v: k for k, v in category_map.items()}
+        train_cat_pred_labels = pd.Series(train_cat_pred).map(inv_category_map)
+        val_cat_pred_labels = pd.Series(val_cat_pred).map(inv_category_map)
+        test_cat_pred_labels = pd.Series(test_cat_pred).map(inv_category_map)
         
-        # Calculate feature importance
+        print("\n📈 Category Model Performance:")
+        print(f"Train Accuracy: {accuracy_score(y_train_category, train_cat_pred_labels):.3f}")
+        print(f"Val Accuracy: {accuracy_score(y_val_category, val_cat_pred_labels):.3f}")
+        print(f"Test Accuracy: {accuracy_score(y_test_category, test_cat_pred_labels):.3f}")
+        
+        # Check for overfitting
+        train_acc = accuracy_score(y_train_category, train_cat_pred_labels)
+        test_acc = accuracy_score(y_test_category, test_cat_pred_labels)
+        
+        if abs(train_acc - test_acc) > 0.1:
+            print("\n⚠️ WARNING: Significant difference between train and test accuracy!")
+            print("Consider increasing regularization parameters.")
+        else:
+            print("\n✅ Model shows good generalization (train/test accuracy difference < 10%)")
+        
+        print("\nClassification Report (Test Set):")
+        print(classification_report(y_test_category, test_cat_pred_labels))
+        
+        # Calculate feature importance from XGBoost
+        importance_dict = self.score_model.get_booster().get_score(importance_type='gain')
+        # Convert to array matching feature order
+        importances = []
+        for i in range(len(self.preprocessor.feature_columns)):
+            importances.append(importance_dict.get(f'f{i}', 0))
+        importances = np.array(importances)
+        importances = importances / importances.sum()
+        
         self.feature_importance = pd.DataFrame({
             'feature': self.preprocessor.feature_columns,
-            'importance': self.score_model.feature_importances_
+            'importance': importances
         }).sort_values('importance', ascending=False)
         
-        print("\nTop 10 Most Important Features:")
-        print(self.feature_importance.head(10))
+        print("\n🏆 Top 10 Most Important Features:")
+        for idx, row in self.feature_importance.head(10).iterrows():
+            print(f"{row['feature']}: {row['importance']:.4f}")
         
-        # Calculate feature impacts through simulation (use training data)
-        print("\nCalculating feature impacts...")
+        # Cross-validation check
+        print("\n🔄 Performing cross-validation...")
+        cv_scores = cross_val_score(
+            self.score_model, 
+            X_train, 
+            y_train_numeric,
+            cv=5,
+            scoring='neg_mean_absolute_error'
+        )
+        print(f"CV MAE scores: {-cv_scores}")
+        print(f"CV MAE mean: {-cv_scores.mean():.2f} (+/- {cv_scores.std() * 2:.2f})")
+        
+        # Calculate feature impacts
+        print("\n📊 Calculating feature impacts...")
         self._calculate_feature_impacts(X_train, train_df)
         
-        print("\nTraining complete!")
+        print("\n✅ Training complete!")
         
-        # Optional: Return metrics for logging
         return {
             'train_mae': mean_absolute_error(y_train_numeric, train_pred),
+            'val_mae': mean_absolute_error(y_val_numeric, val_pred),
             'test_mae': mean_absolute_error(y_test_numeric, test_pred),
+            'train_r2': r2_score(y_train_numeric, train_pred),
+            'val_r2': r2_score(y_val_numeric, val_pred),
             'test_r2': r2_score(y_test_numeric, test_pred),
-            'test_accuracy': accuracy_score(y_test_category, test_cat_pred)
+            'train_accuracy': train_acc,
+            'val_accuracy': accuracy_score(y_val_category, val_cat_pred_labels),
+            'test_accuracy': test_acc,
+            'cv_mae_mean': -cv_scores.mean(),
+            'cv_mae_std': cv_scores.std()
         }
         
     def _prepare_training_data(self, df):
-        """Prepare training data"""
+        """Prepare training data with better validation"""
+        print(f"\n📊 Preparing data - Initial shape: {df.shape}")
+        
         # Remove unnecessary columns
         cols_to_drop = ['ID', 'Customer_ID', 'Name', 'SSN', 'Month']
         df = df.drop(columns=[col for col in cols_to_drop if col in df.columns])
+        print(f"After removing ID columns: {df.shape}")
+        
+        # Remove rows where Credit_Score is missing FIRST
+        if 'Credit_Score' in df.columns:
+            initial_len = len(df)
+            df = df.dropna(subset=['Credit_Score'])
+            print(f"Removed {initial_len - len(df)} rows with missing Credit_Score")
+            
+            # Check what credit score values we have
+            print(f"Unique Credit_Score values: {df['Credit_Score'].unique()[:20]}")  # Show first 20
+            
+            # Handle different Credit_Score formats
+            # First, check if it's numeric (0, 1, 2 or similar)
+            if df['Credit_Score'].dtype in ['int64', 'float64', 'int32', 'float32']:
+                print("Detected numeric Credit_Score values, converting...")
+                # Common numeric mappings
+                if set(df['Credit_Score'].unique()) <= {0, 1, 2}:
+                    score_mapping = {0: 'Poor', 1: 'Standard', 2: 'Good'}
+                elif set(df['Credit_Score'].unique()) <= {1, 2, 3}:
+                    score_mapping = {1: 'Poor', 2: 'Standard', 3: 'Good'}
+                else:
+                    # Use percentiles for other numeric ranges
+                    q33 = df['Credit_Score'].quantile(0.33)
+                    q66 = df['Credit_Score'].quantile(0.66)
+                    df['Credit_Score'] = pd.cut(df['Credit_Score'], 
+                                               bins=[-np.inf, q33, q66, np.inf],
+                                               labels=['Poor', 'Standard', 'Good'])
+                    score_mapping = None
+                
+                if score_mapping:
+                    df['Credit_Score'] = df['Credit_Score'].map(score_mapping)
+            else:
+                # Handle string values
+                df['Credit_Score'] = df['Credit_Score'].astype(str).str.strip().str.title()
+                
+                # Map any variations to standard values
+                score_mapping = {
+                    'Poor': 'Poor',
+                    'Bad': 'Poor',
+                    'Low': 'Poor',
+                    'Standard': 'Standard',
+                    'Average': 'Standard',
+                    'Medium': 'Standard',
+                    'Fair': 'Standard',
+                    'Good': 'Good',
+                    'High': 'Good',
+                    'Excellent': 'Good',
+                    'Very Good': 'Good'
+                }
+                
+                df['Credit_Score'] = df['Credit_Score'].map(lambda x: score_mapping.get(x, x))
+            
+            # Now filter for valid scores
+            valid_scores = ['Poor', 'Standard', 'Good']
+            initial_len = len(df)
+            df = df[df['Credit_Score'].isin(valid_scores)]
+            
+            print(f"Removed {initial_len - len(df)} rows with Credit_Score not in {valid_scores}")
+            
+            if len(df) == 0:
+                print("⚠️ WARNING: All data removed after Credit_Score filtering!")
+                print("Attempting to check original data values...")
+                # Try to reload and check
+                if hasattr(self, 'dataset_path'):
+                    try:
+                        df_temp = pd.read_csv(self.dataset_path)
+                        if 'Credit_Score' in df_temp.columns:
+                            print(f"Original Credit_Score values:\n{df_temp['Credit_Score'].value_counts()}")
+                            print(f"First 10 Credit_Score values: {df_temp['Credit_Score'].head(10).tolist()}")
+                    except:
+                        pass
+                raise ValueError(
+                    "No valid Credit_Score values found. Expected: Poor, Standard, Good. "
+                    "Run diagnose_data.py to check your data format."
+                )
+        
+        print(f"After Credit_Score validation: {df.shape}")
         
         # Handle Age outliers and invalid values
-        if 'Age' in df.columns:
+        if 'Age' in df.columns and len(df) > 0:
             # Convert Age to numeric, treating errors as NaN
             df['Age'] = pd.to_numeric(df['Age'].astype(str).str.replace('_', ''), errors='coerce')
-            # Remove obvious outliers (negative ages or unrealistic ages)
-            df = df[(df['Age'] > 0) & (df['Age'] < 120)]
-            # Fill any remaining NaN ages with median
+            initial_len = len(df)
+            
+            # Very lenient age filtering - just remove impossible values
+            df = df[(df['Age'] >= 0) & (df['Age'] <= 150)]
+            
+            # For any still invalid ages, replace with median instead of removing
             if df['Age'].isna().any():
-                df['Age'] = df['Age'].fillna(df['Age'].median())
+                median_age = df['Age'].median()
+                if pd.isna(median_age):
+                    median_age = 35  # Default if all ages are NaN
+                df['Age'] = df['Age'].fillna(median_age)
+            
+            if initial_len - len(df) > 0:
+                print(f"Removed {initial_len - len(df)} rows with impossible Age values")
         
-        # Remove rows where Credit_Score is missing
-        if 'Credit_Score' in df.columns:
-            df = df.dropna(subset=['Credit_Score'])
-            # Ensure Credit_Score is one of the expected categories
-            valid_scores = ['Poor', 'Standard', 'Good']
-            df = df[df['Credit_Score'].isin(valid_scores)]
+        print(f"After Age cleaning: {df.shape}")
         
-        # Basic outlier removal for other numeric columns
-        numeric_columns = df.select_dtypes(include=[np.number]).columns
-        for col in numeric_columns:
-            if col in df.columns:
-                # Remove values that are more than 5 standard deviations from the mean
-                mean = df[col].mean()
-                std = df[col].std()
-                df = df[np.abs(df[col] - mean) <= 5 * std]
+        # MINIMAL data cleaning - preserve as much data as possible
+        if len(df) > 0:
+            print("Applying minimal data cleaning to preserve samples...")
+            
+            # Only fix obviously wrong values without removing rows
+            numeric_columns = df.select_dtypes(include=[np.number]).columns
+            
+            for col in numeric_columns:
+                if col in df.columns:
+                    # Replace infinite values with NaN, then with median
+                    df[col] = df[col].replace([np.inf, -np.inf], np.nan)
+                    if df[col].isna().any():
+                        median_val = df[col].median()
+                        df[col] = df[col].fillna(median_val)
+                    
+                    # Cap extreme values instead of removing
+                    if col == 'Credit_Utilization_Ratio':
+                        # Cap at 10 instead of removing
+                        df.loc[df[col] > 10, col] = 10
+                        df.loc[df[col] < 0, col] = 0
+                    
+                    elif col in ['Num_of_Delayed_Payment', 'Num_Credit_Inquiries', 'Num_Credit_Card', 
+                                'Num_Bank_Accounts', 'Num_of_Loan']:
+                        # Cap counts at reasonable maximum
+                        df.loc[df[col] < 0, col] = 0
+                        df.loc[df[col] > 100, col] = 100
+                        df[col] = df[col].round()
+                    
+                    elif col in ['Outstanding_Debt', 'Annual_Income', 'Monthly_Balance', 
+                                'Monthly_Inhand_Salary', 'Total_EMI_per_month', 'Amount_invested_monthly']:
+                        # Ensure non-negative for money values
+                        df.loc[df[col] < 0, col] = 0
+                        # Cap at 99th percentile to handle extreme values
+                        cap_value = df[col].quantile(0.99) * 2  # 2x the 99th percentile
+                        df.loc[df[col] > cap_value, col] = cap_value
+                    
+                    elif col == 'Interest_Rate':
+                        # Interest rates should be reasonable
+                        df.loc[df[col] < 0, col] = 0
+                        df.loc[df[col] > 50, col] = 50
+                    
+                    elif col == 'Credit_History_Age':
+                        # Credit history in months/years - cap at reasonable max
+                        df.loc[df[col] < 0, col] = 0
+                        df.loc[df[col] > 600, col] = 600  # 50 years
+            
+            print(f"After value capping (no rows removed): {df.shape}")
         
-        print(f"Data shape after cleaning: {df.shape}")
-        print(f"Columns in dataset: {list(df.columns)}")
+        print(f"After outlier removal: {df.shape}")
+        
+        # Remove any remaining duplicates
+        initial_len = len(df)
+        df = df.drop_duplicates()
+        if initial_len - len(df) > 0:
+            print(f"Removed {initial_len - len(df)} duplicate rows")
+        
+        # Ensure we have enough data
+        if len(df) < 100:
+            print(f"⚠️ WARNING: Only {len(df)} samples after cleaning. Model may not perform well.")
+            # If we have too little data, reload and be less aggressive
+            if len(df) < 10:
+                print("🚨 CRITICAL: Too few samples. Attempting less aggressive cleaning...")
+                # This is a fallback - you might need to adjust based on your actual data
+                return df  # Return whatever we have
+        
+        print(f"Final data shape after cleaning: {df.shape}")
+        
+        if len(df.columns) > 0:
+            print(f"Columns in dataset: {list(df.columns)[:10]}...")  # Show first 10
+        
+        if 'Credit_Score' in df.columns and len(df) > 0:
+            print(f"Credit Score distribution:\n{df['Credit_Score'].value_counts()}")
         
         return df
     
@@ -358,42 +681,39 @@ class CreditScoreOptimizer:
         # Run what-if scenarios
         recommendations = []
         
+        # Get top features by importance
         top_features = self.feature_importance.head(15)
         
         for _, row in top_features.iterrows():
             feature = row['feature']
             
-            # Skip if not a modifiable feature
+            # Skip if not a modifiable numeric feature
             if feature not in self.preprocessor.numeric_features:
                 continue
                 
             if feature not in user_data:
                 continue
             
-            # Generate scenarios
-            scenarios = self._generate_scenarios(feature, user_data[feature], user_processed)
+            # Generate scenarios for this feature
+            scenarios = self._generate_scenarios(feature, user_data[feature], user_data, current_score)
             
             for scenario in scenarios:
-                # Predict new score
-                new_score = int(self.score_model.predict(scenario['data'])[0])
-                improvement = new_score - current_score
-                
-                if improvement > 5:  # Only include meaningful improvements
+                if scenario['predicted_improvement'] > 5:  # Only include meaningful improvements
                     recommendation = {
                         'feature': feature,
                         'current_value': user_data[feature],
                         'target_value': scenario['new_value'],
                         'change_amount': scenario['change_amount'],
-                        'predicted_improvement': improvement,
+                        'predicted_improvement': scenario['predicted_improvement'],
                         'effort_score': scenario['effort'],
                         'specific_action': self._generate_specific_action(
-                            feature, user_data[feature], scenario['new_value'], improvement
+                            feature, user_data[feature], scenario['new_value'], scenario['predicted_improvement']
                         ),
                         'importance': row['importance']
                     }
                     recommendations.append(recommendation)
         
-        
+        # Keep only the best recommendation per feature
         best_by_feature = {}
         for rec in recommendations:
             feature = rec['feature']
@@ -411,9 +731,15 @@ class CreditScoreOptimizer:
         # Add combination scenarios
         if len(recommendations) >= 2:
             combo_recommendations = self._generate_combination_scenarios(
-                user_data, user_processed, current_score, recommendations[:3]
+                user_data, current_score, recommendations[:3]
             )
             recommendations.extend(combo_recommendations)
+        
+        # Final sort
+        recommendations.sort(
+            key=lambda x: x['predicted_improvement'] / (x['effort_score'] + 1), 
+            reverse=True
+        )
         
         return {
             'current_score': current_score,
@@ -422,10 +748,9 @@ class CreditScoreOptimizer:
             'high_impact': [r for r in recommendations if r['predicted_improvement'] >= 50][:3]
         }
     
-    def _generate_scenarios(self, feature, current_value, user_processed):
+    def _generate_scenarios(self, feature, current_value, user_data, current_score):
         """Generate what-if scenarios for a feature"""
         scenarios = []
-        feature_idx = self.preprocessor.feature_columns.index(feature)
         
         # Define features where LOWER is better
         LOWER_IS_BETTER = [
@@ -438,133 +763,75 @@ class CreditScoreOptimizer:
             'Total_EMI_per_month'
         ]
         
-        # Define features where HIGHER is better
-        HIGHER_IS_BETTER = [
-            'Amount_invested_monthly',
-            'Monthly_Balance',
-            'Credit_History_Age',  # But can't change this
-            'Annual_Income',  # But shouldn't recommend this
-            'Monthly_Inhand_Salary'  # But shouldn't recommend this
-        ]
-        
-        # Special cases
-        SPECIAL_CASES = ['Num_Credit_Card', 'Num_Bank_Accounts']
-        
         # Skip non-actionable features
         NON_ACTIONABLE = ['Annual_Income', 'Monthly_Inhand_Salary', 'Credit_History_Age', 'Age']
         if feature in NON_ACTIONABLE:
             return []
         
-        # Special handling for specific features
+        # Generate test values based on feature type
+        test_values = []
+        
         if feature == 'Credit_Utilization_Ratio':
             # Always recommend lowering utilization
             if current_value > 0.05:
                 targets = [0.3, 0.25, 0.1, 0.05] if current_value > 0.3 else [current_value * 0.5, current_value * 0.25]
-                for target in targets:
-                    if target < current_value:
-                        test_data = user_processed.copy()
-                        scaled_target = self.preprocessor.scalers[feature].transform([[target]])[0][0]
-                        test_data.iloc[0, feature_idx] = scaled_target
-                        
-                        effort = self._calculate_effort(feature, current_value, target)
-                        scenarios.append({
-                            'data': test_data,
-                            'new_value': target,
-                            'change_amount': target - current_value,
-                            'effort': effort
-                        })
-                        
-        elif feature in ['Outstanding_Debt', 'Num_of_Delayed_Payment']:
-            # Always recommend reducing these
-            reductions = [0.25, 0.5, 0.75, 1.0]
-            for reduction in reductions:
-                new_value = current_value * (1 - reduction)
-                if feature == 'Num_of_Delayed_Payment':
-                    new_value = int(new_value)
-                    
-                test_data = user_processed.copy()
-                scaled_value = self.preprocessor.scalers[feature].transform([[new_value]])[0][0]
-                test_data.iloc[0, feature_idx] = scaled_value
+                test_values = [t for t in targets if t < current_value]
                 
-                effort = self._calculate_effort(feature, current_value, new_value)
-                scenarios.append({
-                    'data': test_data,
-                    'new_value': new_value,
-                    'change_amount': new_value - current_value,
-                    'effort': effort
-                })
+        elif feature == 'Num_of_Delayed_Payment':
+            # Always recommend reducing these
+            if current_value > 0:
+                test_values = [max(0, current_value - 1), max(0, current_value - 2), 0]
+                
+        elif feature == 'Outstanding_Debt':
+            # Recommend reducing debt
+            if current_value > 0:
+                test_values = [current_value * 0.75, current_value * 0.5, current_value * 0.25]
                 
         elif feature == 'Num_Credit_Card':
             # Special logic: only recommend fewer cards if user has many
             if current_value > 5:
-                # Too many cards - recommend reduction
-                for new_value in [4, 3]:
-                    if new_value < current_value:
-                        test_data = user_processed.copy()
-                        scaled_value = self.preprocessor.scalers[feature].transform([[new_value]])[0][0]
-                        test_data.iloc[0, feature_idx] = scaled_value
-                        
-                        effort = self._calculate_effort(feature, current_value, new_value)
-                        scenarios.append({
-                            'data': test_data,
-                            'new_value': new_value,
-                            'change_amount': new_value - current_value,
-                            'effort': effort
-                        })
-            # Don't recommend more cards if already have 3+
+                test_values = [4, 3]
+            # Don't recommend more cards
             
         elif feature == 'Num_Credit_Inquiries':
-            # Can only wait for inquiries to age off (they disappear after 2 years)
-            # Don't suggest increasing! Only suggest waiting
+            # Can only wait for inquiries to age off
             if current_value > 0:
-                # Inquiries age off over time
-                for new_value in [max(0, current_value - 2), max(0, current_value - 4), 0]:
-                    if new_value < current_value:
-                        test_data = user_processed.copy()
-                        scaled_value = self.preprocessor.scalers[feature].transform([[new_value]])[0][0]
-                        test_data.iloc[0, feature_idx] = scaled_value
-                        
-                        effort = 1  # Easy - just wait
-                        scenarios.append({
-                            'data': test_data,
-                            'new_value': new_value,
-                            'change_amount': new_value - current_value,
-                            'effort': effort
-                        })
-                        
+                test_values = [max(0, current_value - 2), max(0, current_value - 4), 0]
+                
         elif feature in LOWER_IS_BETTER:
             # For features that should decrease
-            reductions = [0.25, 0.5, 0.75]
-            for reduction in reductions:
-                new_value = current_value * (1 - reduction)
-                test_data = user_processed.copy()
-                scaled_value = self.preprocessor.scalers[feature].transform([[new_value]])[0][0]
-                test_data.iloc[0, feature_idx] = scaled_value
+            if current_value > 0:
+                test_values = [current_value * 0.75, current_value * 0.5, current_value * 0.25]
+        else:
+            # For features that should increase (e.g., savings, investments)
+            test_values = [current_value * 1.25, current_value * 1.5, current_value * 2.0]
+        
+        # Test each value
+        for new_value in test_values:
+            if new_value == current_value:
+                continue
                 
-                effort = self._calculate_effort(feature, current_value, new_value)
-                scenarios.append({
-                    'data': test_data,
-                    'new_value': new_value,
-                    'change_amount': new_value - current_value,
-                    'effort': effort
-                })
+            # Create a copy of user data with the modified value
+            modified_data = user_data.copy()
+            modified_data[feature] = new_value
+            
+            # Transform the modified data
+            try:
+                modified_processed = self.preprocessor.transform(modified_data)
+                new_score = int(self.score_model.predict(modified_processed)[0])
+                improvement = new_score - current_score
                 
-        elif feature in HIGHER_IS_BETTER:
-            # For features that should increase
-            increases = [0.25, 0.5, 1.0]
-            for increase in increases:
-                new_value = current_value * (1 + increase)
-                test_data = user_processed.copy()
-                scaled_value = self.preprocessor.scalers[feature].transform([[new_value]])[0][0]
-                test_data.iloc[0, feature_idx] = scaled_value
-                
-                effort = self._calculate_effort(feature, current_value, new_value)
-                scenarios.append({
-                    'data': test_data,
-                    'new_value': new_value,
-                    'change_amount': new_value - current_value,
-                    'effort': effort
-                })
+                if improvement > 0:  # Only add if it improves the score
+                    effort = self._calculate_effort(feature, current_value, new_value)
+                    scenarios.append({
+                        'new_value': new_value,
+                        'change_amount': new_value - current_value,
+                        'predicted_improvement': improvement,
+                        'effort': effort
+                    })
+            except Exception as e:
+                print(f"Error generating scenario for {feature}: {e}")
+                continue
                 
         return scenarios
     
@@ -581,6 +848,8 @@ class CreditScoreOptimizer:
             'Monthly_Balance': 4 + change_pct * 6,
             'Credit_History_Age': 10,  # Very hard - requires time
             'Interest_Rate': 6,  # Medium - requires refinancing
+            'Total_EMI_per_month': 5 + change_pct * 7,
+            'Num_Credit_Card': 3,  # Easy to close cards
         }
         
         base_effort = effort_map.get(feature, 5)
@@ -618,6 +887,16 @@ class CreditScoreOptimizer:
                 'template': "Build savings from ${current:,.0f} to ${target:,.0f} monthly balance. "
                            "Set up automatic transfer right after payday. "
                            "This demonstrates stability and could add {improvement} points.",
+            },
+            'Total_EMI_per_month': {
+                'template': "Reduce monthly debt payments from ${current:,.0f} to ${target:,.0f}. "
+                           "Consider consolidating high-interest debts. "
+                           "Could improve score by {improvement} points.",
+            },
+            'Num_Credit_Card': {
+                'template': "Reduce number of credit cards from {current:.0f} to {target:.0f}. "
+                           "Close newer cards with lower limits first. "
+                           "This simplification could add {improvement} points.",
             }
         }
         
@@ -626,81 +905,53 @@ class CreditScoreOptimizer:
         
         return template.format(current=current, target=target, improvement=improvement)
     
-    def _generate_combination_scenarios(self, user_data, user_processed, current_score, top_recs):
+    def _generate_combination_scenarios(self, user_data, current_score, top_recs):
         """Generate scenarios combining multiple changes"""
         combo_recs = []
         
-        # Create a copy of the processed data to apply changes
-        test_data = user_processed.copy()
+        if len(top_recs) < 2:
+            return combo_recs
+        
+        # Apply top 3 recommendations together
+        modified_data = user_data.copy()
         total_effort = 0
         changes = []
-        applied_changes = {}
         
-        # Iterate through top recommendations and apply changes
         for rec in top_recs[:3]:
             feature = rec['feature']
-            
-            # Check if feature exists in the processed data
-            if feature not in test_data.columns:
-                print(f"Warning: Feature '{feature}' not found in processed data")
-                continue
-                
-            # Store the changes to apply
-            applied_changes[feature] = rec['target_value']
-            total_effort += rec['effort_score']
-            changes.append(f"{feature}: {rec['current_value']:.1f} → {rec['target_value']:.1f}")
+            if feature in modified_data:
+                modified_data[feature] = rec['target_value']
+                total_effort += rec['effort_score']
+                changes.append(f"{feature}: {rec['current_value']:.1f} → {rec['target_value']:.1f}")
         
-        # If we have valid changes to apply
-        if applied_changes:
-            # Create a copy of the original user data for transformation
-            modified_user_data = user_data.copy()
+        # Transform and predict
+        try:
+            modified_processed = self.preprocessor.transform(modified_data)
+            new_score = int(self.score_model.predict(modified_processed)[0])
+            improvement = new_score - current_score
             
-            # Apply all changes to the original data
-            for feature, target_value in applied_changes.items():
-                if feature in modified_user_data.columns:
-                    modified_user_data[feature] = target_value
+            # Calculate expected improvement (sum of individual improvements)
+            expected_improvement = sum(r['predicted_improvement'] for r in top_recs[:3])
             
-            # Re-process the entire modified data through the preprocessor
-            try:
-                test_data_transformed = self.preprocessor.transform(modified_user_data)
+            # Only recommend if combination provides significant benefit
+            if improvement > expected_improvement * 0.8 and improvement > 10:
+                avg_effort = total_effort / 3
                 
-                # If transform returns numpy array, convert back to DataFrame
-                if isinstance(test_data_transformed, np.ndarray):
-                    test_data_transformed = pd.DataFrame(
-                        test_data_transformed, 
-                        columns=user_processed.columns
-                    )
-            except Exception as e:
-                print(f"Error transforming combined data: {e}")
-                return combo_recs
-            
-            try:
-                new_score = int(self.score_model.predict(test_data_transformed)[0])
-                improvement = new_score - current_score
+                combo_recs.append({
+                    'feature': 'Combined Actions',
+                    'current_value': 'Multiple factors',
+                    'target_value': 'Optimized values',
+                    'change_amount': f'{len(changes)} changes',
+                    'predicted_improvement': improvement,
+                    'effort_score': avg_effort,
+                    'specific_action': f"Combine these actions for maximum impact (+{improvement} points total):\n" + 
+                                    "\n".join(f"• {change}" for change in changes),
+                    'importance': 1.0,
+                    'synergy_bonus': improvement - expected_improvement
+                })
                 
-                # Calculate expected improvement (sum of individual improvements)
-                expected_improvement = sum(r['predicted_improvement'] for r in top_recs[:len(applied_changes)])
-                
-                # Only recommend if combination provides significant benefit
-                # (more than 80% of sum of individual improvements suggests synergy)
-                if improvement > expected_improvement * 0.8:
-                    avg_effort = total_effort / len(applied_changes) if applied_changes else 0
-                    
-                    combo_recs.append({
-                        'feature': 'Combined Actions',
-                        'current_value': 'Multiple factors',
-                        'target_value': 'Optimized values',
-                        'change_amount': f'{len(applied_changes)} changes',
-                        'predicted_improvement': improvement,
-                        'effort_score': avg_effort,
-                        'specific_action': f"Combine these actions for maximum impact (+{improvement} points total):\n" + 
-                                        "\n".join(f"• {change}" for change in changes),
-                        'importance': 1.0,
-                        'synergy_bonus': improvement - expected_improvement  # Track how much extra benefit
-                    })
-                    
-            except Exception as e:
-                print(f"Error predicting combined score: {e}")
+        except Exception as e:
+            print(f"Error in combination scenario: {e}")
         
         return combo_recs
     
@@ -724,4 +975,3 @@ class CreditScoreOptimizer:
             self.feature_importance = data['feature_importance']
             self.feature_impacts = data['feature_impacts']
         print(f"Model loaded from {filepath}")
-
