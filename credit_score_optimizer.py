@@ -397,19 +397,49 @@ class CreditScoreOptimizer:
         print("\nClassification Report (Test Set):")
         print(classification_report(y_test_category, test_cat_pred_labels))
         
-        # Calculate feature importance from XGBoost
-        importance_dict = self.score_model.get_booster().get_score(importance_type='gain')
-        # Convert to array matching feature order
-        importances = []
-        for i in range(len(self.preprocessor.feature_columns)):
-            importances.append(importance_dict.get(f'f{i}', 0))
-        importances = np.array(importances)
-        importances = importances / importances.sum()
-        
-        self.feature_importance = pd.DataFrame({
-            'feature': self.preprocessor.feature_columns,
-            'importance': importances
-        }).sort_values('importance', ascending=False)
+       # Calculate feature importance using XGBoost's built-in method
+        try:
+            # Get feature importance directly from the model
+            if hasattr(self.score_model, 'feature_importances_'):
+                importances = self.score_model.feature_importances_
+                print(f"Got {len(importances)} feature importances from model")
+            else:
+                # Fallback to booster method
+                booster = self.score_model.get_booster()
+                importance_dict = booster.get_score(importance_type='gain')
+                print(f"Importance dict keys: {list(importance_dict.keys())[:5]}...")
+                
+                # Create importance array
+                importances = np.zeros(len(self.preprocessor.feature_columns))
+                for i in range(len(self.preprocessor.feature_columns)):
+                    # Try different key formats
+                    if f'f{i}' in importance_dict:
+                        importances[i] = importance_dict[f'f{i}']
+            
+            # Check if we got any non-zero importances
+            if importances.sum() == 0:
+                print("WARNING: All importances are zero! Using uniform distribution.")
+                importances = np.ones(len(self.preprocessor.feature_columns))
+            
+            # Normalize (avoid division by zero)
+            importances = importances / (importances.sum() + 1e-10)
+            
+            self.feature_importance = pd.DataFrame({
+                'feature': self.preprocessor.feature_columns,
+                'importance': importances
+            }).sort_values('importance', ascending=False)
+            
+            print(f"Feature importance shape: {self.feature_importance.shape}")
+            print(f"Sum of importances: {importances.sum()}")
+            
+        except Exception as e:
+            print(f"Error calculating feature importance: {e}")
+            # Use uniform importance as fallback
+            importances = np.ones(len(self.preprocessor.feature_columns)) / len(self.preprocessor.feature_columns)
+            self.feature_importance = pd.DataFrame({
+                'feature': self.preprocessor.feature_columns,
+                'importance': importances
+            })
         
         print("\n🏆 Top 10 Most Important Features:")
         for idx, row in self.feature_importance.head(10).iterrows():
@@ -486,10 +516,8 @@ class CreditScoreOptimizer:
                 if score_mapping:
                     df['Credit_Score'] = df['Credit_Score'].map(score_mapping)
             else:
-                # Handle string values
                 df['Credit_Score'] = df['Credit_Score'].astype(str).str.strip().str.title()
                 
-                # Map any variations to standard values
                 score_mapping = {
                     'Poor': 'Poor',
                     'Bad': 'Poor',
@@ -553,9 +581,7 @@ class CreditScoreOptimizer:
         
         print(f"After Age cleaning: {df.shape}")
         
-        # MINIMAL data cleaning - preserve as much data as possible
         if len(df) > 0:
-            print("Applying minimal data cleaning to preserve samples...")
             
             # Only fix obviously wrong values without removing rows
             numeric_columns = df.select_dtypes(include=[np.number]).columns
@@ -600,23 +626,12 @@ class CreditScoreOptimizer:
                         df.loc[df[col] > 600, col] = 600  # 50 years
             
             print(f"After value capping (no rows removed): {df.shape}")
+    
         
-        print(f"After outlier removal: {df.shape}")
-        
-        # Remove any remaining duplicates
         initial_len = len(df)
         df = df.drop_duplicates()
         if initial_len - len(df) > 0:
             print(f"Removed {initial_len - len(df)} duplicate rows")
-        
-        # Ensure we have enough data
-        if len(df) < 100:
-            print(f"⚠️ WARNING: Only {len(df)} samples after cleaning. Model may not perform well.")
-            # If we have too little data, reload and be less aggressive
-            if len(df) < 10:
-                print("🚨 CRITICAL: Too few samples. Attempting less aggressive cleaning...")
-                # This is a fallback - you might need to adjust based on your actual data
-                return df  # Return whatever we have
         
         print(f"Final data shape after cleaning: {df.shape}")
         
@@ -630,45 +645,125 @@ class CreditScoreOptimizer:
     
     def _calculate_feature_impacts(self, X, original_df):
         """Calculate how much each feature change impacts score"""
+        print("Calculating impacts for numeric features...")
+        
         # Sample data for impact analysis
         sample_size = min(1000, len(X))
+        if sample_size < 10:
+            print("Warning: Too few samples for impact analysis")
+            return
+            
         sample_indices = np.random.choice(len(X), sample_size, replace=False)
         
         for feature in self.preprocessor.numeric_features:
             if feature not in self.preprocessor.feature_columns:
                 continue
                 
-            feature_idx = self.preprocessor.feature_columns.index(feature)
-            impacts = []
-            
-            # Test different change percentages
-            for idx in sample_indices:
-                base_score = self.score_model.predict(X.iloc[idx:idx+1])[0]
+            try:
+                feature_idx = self.preprocessor.feature_columns.index(feature)
+                impacts = []
+                skipped_count = 0
                 
-                # Try 10% improvement
-                test_data = X.iloc[idx:idx+1].copy()
-                current_val = test_data.iloc[0, feature_idx]
+                # Test different change percentages
+                for idx in sample_indices[:100]:  # Limit to 100 samples for speed
+                    try:
+                        # Get base prediction
+                        base_score = self.score_model.predict(X.iloc[idx:idx+1])[0]
+                        
+                        # Check if base_score is valid
+                        if pd.isna(base_score):
+                            print(f"WARNING: NaN base score for feature {feature} at index {idx}")
+                            skipped_count += 1
+                            continue
+                        
+                        # Try 10% improvement
+                        test_data = X.iloc[idx:idx+1].copy()
+                        current_val = test_data.iloc[0, feature_idx]
+                        
+                        # Skip if current value is 0 or NaN
+                        if pd.isna(current_val) or current_val == 0:
+                            skipped_count += 1
+                            continue
+                        
+                        # Determine improvement direction
+                        if feature in ['Outstanding_Debt', 'Credit_Utilization_Ratio', 'Num_of_Delayed_Payment', 
+                                    'Delay_from_due_date', 'Num_Credit_Inquiries']:
+                            # Lower is better
+                            new_val = current_val * 0.9
+                        else:
+                            # Higher is better
+                            new_val = current_val * 1.1
+                            
+                        test_data.iloc[0, feature_idx] = new_val
+                        new_score = self.score_model.predict(test_data)[0]
+                        
+                        # Check if new_score is valid
+                        if pd.isna(new_score):
+                            print(f"WARNING: NaN new score for feature {feature}")
+                            skipped_count += 1
+                            continue
+                        
+                        impact = new_score - base_score
+                        
+                        # Only add valid impacts
+                        if not pd.isna(impact):
+                            impacts.append(impact)
+                        else:
+                            skipped_count += 1
+                            
+                    except Exception as e:
+                        print(f"Error in inner loop for {feature}: {e}")
+                        skipped_count += 1
+                        continue
                 
-                # Determine improvement direction
-                if feature in ['Outstanding_Debt', 'Credit_Utilization_Ratio', 'Num_of_Delayed_Payment', 
-                              'Delay_from_due_date', 'Num_Credit_Inquiries']:
-                    # Lower is better
-                    new_val = current_val * 0.9
-                else:
-                    # Higher is better
-                    new_val = current_val * 1.1
+                # Calculate statistics only if we have valid impacts
+                if len(impacts) > 0 and not all(pd.isna(impacts)):
+                    # Filter out any remaining NaN values
+                    valid_impacts = [i for i in impacts if not pd.isna(i)]
                     
-                test_data.iloc[0, feature_idx] = new_val
-                new_score = self.score_model.predict(test_data)[0]
-                
-                impact = new_score - base_score
-                impacts.append(impact)
-            
-            self.feature_impacts[feature] = {
-                'avg_impact_per_10pct': np.mean(impacts),
-                'std_impact': np.std(impacts)
-            }
-    
+                    if len(valid_impacts) > 0:
+                        self.feature_impacts[feature] = {
+                            'avg_impact_per_10pct': float(np.mean(valid_impacts)),
+                            'std_impact': float(np.std(valid_impacts)),
+                            'num_samples': len(valid_impacts),
+                            'skipped_samples': skipped_count
+                        }
+                    else:
+                        print(f"WARNING: No valid impacts for {feature}")
+                        self.feature_impacts[feature] = {
+                            'avg_impact_per_10pct': 0.0,
+                            'std_impact': 0.0,
+                            'num_samples': 0,
+                            'skipped_samples': skipped_count
+                        }
+                else:
+                    print(f"WARNING: Empty or all-NaN impacts for {feature}")
+                    self.feature_impacts[feature] = {
+                        'avg_impact_per_10pct': 0.0,
+                        'std_impact': 0.0,
+                        'num_samples': 0,
+                        'skipped_samples': skipped_count
+                    }
+                    
+            except Exception as e:
+                print(f"Error calculating impact for {feature}: {e}")
+                import traceback
+                traceback.print_exc()
+                self.feature_impacts[feature] = {
+                    'avg_impact_per_10pct': 0.0,
+                    'std_impact': 0.0,
+                    'num_samples': 0,
+                    'skipped_samples': 0
+                }
+        
+        # Debug output
+        print(f"\nCalculated impacts for {len(self.feature_impacts)} features")
+        print("\nFeature impact summary:")
+        for feature, impact in self.feature_impacts.items():
+            if impact['num_samples'] > 0:
+                print(f"  {feature}: avg_impact={impact['avg_impact_per_10pct']:.4f}, "
+                    f"samples={impact['num_samples']}, skipped={impact['skipped_samples']}")
+        
     def get_recommendations(self, user_data, current_score=None):
         """Get specific recommendations with predicted improvements"""
         # Preprocess user data
@@ -728,14 +823,14 @@ class CreditScoreOptimizer:
             reverse=True
         )
 
-        # Add combination scenarios
+
         if len(recommendations) >= 2:
             combo_recommendations = self._generate_combination_scenarios(
                 user_data, current_score, recommendations[:3]
             )
             recommendations.extend(combo_recommendations)
         
-        # Final sort
+
         recommendations.sort(
             key=lambda x: x['predicted_improvement'] / (x['effort_score'] + 1), 
             reverse=True
