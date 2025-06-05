@@ -3,8 +3,7 @@ import pandas as pd
 import requests
 import re
 
-# Load the trained model
-with open("credit_optimizer_model.pkl", "rb") as f:
+with open("credit_optimizer_model 1.pkl", "rb") as f:
     model_data = pickle.load(f)
 
 preprocessor = model_data["preprocessor"]
@@ -119,26 +118,32 @@ def run_credit_optimizer(user_data):
     explain_score(user_data)
         
 def explain_score(user_data):
-        print("\nFeatures Impact on Your Scores")
-        baseline_data = pd.DataFrame([user_data])
-        default_input = preprocessor.transform(baseline_data)
-        original_score = score_model.predict(default_input)[0]
-    
-        for field in user_data:
-            modified_data = user_data.copy()
-            if isinstance(modified_data[field], (int, float)):
-                modified_data[field] = modified_data[field] * 1.1 if modified_data[field] != 0 else 1
-            else:
-                continue 
-    
-            test_input = preprocessor.transform(pd.DataFrame([modified_data]))
-            modified_score = score_model.predict(test_input)[0]
-            delta = modified_score - original_score
-            direction = "increased" if delta > 0 else "decreased"
-            print(f"- {field.replace('_',' ')} {direction} your score by {abs(delta):.1f} points")
+    print("\nFeatures Impact on Your Score:")
+
+ 
+    defaults = {key: 0 for key in user_data}
+    X_base = preprocessor.transform(pd.DataFrame([defaults]))
+    base_score = score_model.predict(X_base)[0]
+
+    total = 0.0
+
+    for field in user_data:
+        modified = defaults.copy()
+        modified[field] = user_data[field]
+        X_mod = preprocessor.transform(pd.DataFrame([modified]))
+        mod_score = score_model.predict(X_mod)[0]
+
+        delta = mod_score - base_score
+        total += delta
+        direction = "increased" if delta > 0 else "decreased" if delta < 0 else "had no effect on"
+        print(f"- {field.replace('_',' ')} {direction} your score by {abs(delta):.1f} points")
+
+    print(f"\nTotal predicted score: {int(base_score + total)}")
+
+
 
 def main():
-    print("\nWelcome to the LLaMA Credit Score Assistant!")
+    print("\nWelcome to the Fico Buddy Credit Score Assistant!")
     print("Answer a few friendly questions to get a credit score estimate.")
     print("Type 'skip' to skip or 'exit' to quit.\n")
 
