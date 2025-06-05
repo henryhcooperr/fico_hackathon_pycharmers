@@ -2,6 +2,11 @@ import pickle
 import pandas as pd
 import requests
 import re
+import sys
+from flask import Flask, request, jsonify
+from flask_cors import CORS
+import subprocess
+import time
 import json
 
 with open("credit_optimizer_model.pkl", "rb") as f:
@@ -22,72 +27,40 @@ conversation_history = [
 ]
 
 def ask_llama(prompt):
-    """Fixed version using the generate endpoint which is more reliable"""
-    
-    # Build conversation context
-    full_prompt = ""
-    
-    # Add conversation history to prompt
-    for msg in conversation_history[-5:]:  # Last 5 messages for context
-        if msg["role"] == "system":
-            full_prompt += f"System: {msg['content']}\n\n"
-        elif msg["role"] == "user":
-            full_prompt += f"User: {msg['content']}\n"
-        elif msg["role"] == "assistant":
-            full_prompt += f"Assistant: {msg['content']}\n"
-    
-    # Add current prompt
-    full_prompt += f"User: {prompt}\nAssistant: "
-    
-    # Use the generate endpoint instead of chat
-    url = "http://localhost:11434/api/generate"
+    conversation_history.append({"role": "user", "content": str(prompt)})
+    safe_history = [
+        {"role": msg["role"], "content": str(msg.get("content", ""))}
+        for msg in conversation_history
+    ]
+
+    url = "http://localhost:8011/api/chat"
     headers = {"Content-Type": "application/json"}
     payload = {
-        "model": "llama3:latest",
-        "prompt": full_prompt,
-        "stream": False,
-        "options": {
-            "temperature": 0.7,
-            "num_predict": 500
-        }
+        "model": "llama3",
+        "messages": safe_history,
+        "stream": False
     }
-    
     try:
-        response = requests.post(url, headers=headers, json=payload, timeout=60)
+        response = requests.post(url, headers=headers, json=payload)
         response.raise_for_status()
-        
-        # Parse the response
-        result = response.json()
-        
-        # Extract the generated text
-        if "response" in result:
-            reply = result["response"].strip()
+        json_response = response.json()
+
+        reply = json_response.get("choices", [{}])[0].get("message", {}).get("content", "").strip()
+        if reply:
+            conversation_history.append({"role": "assistant", "content": reply})
+            return reply
         else:
-            reply = "I couldn't understand the response format."
-            
-        # Update conversation history
-        conversation_history.append({"role": "user", "content": prompt})
-        conversation_history.append({"role": "assistant", "content": reply})
-        
-        return reply
-        
-    except requests.exceptions.ConnectionError:
-        return "Error: Cannot connect to Ollama. Make sure it's running (ollama serve)."
-    except requests.exceptions.HTTPError as e:
-        return f"HTTP Error: {e}. The generate endpoint should work with llama3:latest."
-    except requests.exceptions.Timeout:
-        return "Error: Request timed out. Try a shorter prompt or check if Ollama is responding."
+            return "LLaMA responded but gave no message."
     except Exception as e:
-        return f"Error: {str(e)}"
+        return f"LLaMA error: {str(e)}"
 
 def test_ollama_connection():
-    """Test if Ollama is running and accessible"""
     try:
         response = requests.get("http://localhost:11434/api/tags", timeout=5)
         if response.status_code == 200:
             models = response.json().get("models", [])
             if models:
-                print("✅ Ollama is running. Available models:")
+                print(" Ollama is running. Available models:")
                 for model in models:
                     print(f"   - {model['name']}")
                 return True
@@ -97,7 +70,7 @@ def test_ollama_connection():
                 return False
         return False
     except:
-        print("❌ Cannot connect to Ollama. Make sure it's running:")
+        print(" Cannot connect to Ollama. Make sure it's running:")
         print("   Run: ollama serve")
         return False
 
@@ -150,9 +123,7 @@ field_questions = {
 
 def run_credit_optimizer(user_data):
     print("\n🔍 Analyzing your responses...\n")
-    
-    # Fill in missing values with defaults
-    defaults = {
+        defaults = {
         'Age': 30,
         'Monthly_Inhand_Salary': user_data.get('Annual_Income', 50000) / 12,
         'Num_Bank_Accounts': 2,
@@ -213,7 +184,7 @@ def run_credit_optimizer(user_data):
             "content": "You are an expert financial advisor. Provide specific, advanced strategies based on the user's profile."
         })
         
-        print("\n🚀 Advanced Strategies:")
+        print("\nAdvanced Strategies:")
         advanced_prompt = (
             f"Based on this profile: Score {int(prediction)}, "
             f"Income ${user_data.get('Annual_Income', 0):,}/year, "
@@ -259,7 +230,6 @@ def explain_score(user_data, complete_data, prediction):
             delta = mod_score - base_score
             impacts.append((field, delta))
     
-    # Sort by absolute impact
     impacts.sort(key=lambda x: abs(x[1]), reverse=True)
     
     for field, delta in impacts:
@@ -275,10 +245,9 @@ def explain_score(user_data, complete_data, prediction):
     print(f"   Final Score: {int(prediction)}")
 
 def main():
-    print("\n🎯 Welcome to the Fico Buddy Credit Score Assistant!")
+    print("\n🎯 Welcome to the FicoBuddy Credit Score Assistant!")
     print("="*50)
     
-    # Test Ollama connection first
     if not test_ollama_connection():
         print("\n⚠️  Continuing without AI assistance...")
         print("You'll still get your credit score estimate!\n")
@@ -318,5 +287,43 @@ def main():
         print("\n⚠️  Not enough responses to make an accurate prediction.")
         print("Please answer at least 5 questions for a credit score estimate.")
 
+def start_ngrok():
+    print("Starting ngrok tunnel...")
+    ngrok_process = subprocess.Popen(["ngrok", "http", "--domain=known-highly-treefrog.ngrok-free.app", "5000"], stdout=subprocess.DEVNULL)
+    time.sleep(5)  
+
+    try:
+        ngrok_api = requests.get("http://localhost:4040/api/tunnels")
+        public_url = ngrok_api.json()["tunnels"][0]["public_url"]
+        print(f"\n Your Flask API is publicly available at: {public_url}/api/chat\n")
+    except Exception as e:
+        print(f"Failed to fetch ngrok URL: {e}")
+
+
 if __name__ == "__main__":
-    main()
+    if len(sys.argv) > 1 and sys.argv[1] == "api":
+        from flask import Flask, request, jsonify
+        from flask_cors import CORS
+
+        app = Flask(__name__)
+        CORS(app, origins=["http://localhost:59824"])
+
+        @app.route("/api/chat", methods=["GET", "POST"])
+        def chat_endpoint():
+            if request.method == "GET":
+                return jsonify({"message": "Chat endpoint is alive!"})
+
+            if request.method == "POST":
+                data = request.get_json()
+                user_message = data.get("message")
+                if not user_message:
+                    return jsonify({"error": "Missing 'message' in request body"}), 400
+                ai_reply = ask_llama(user_message)
+                return jsonify({"response": ai_reply})
+
+        start_ngrok() 
+        app.run(port=5000)
+    else:
+        main()
+
+
