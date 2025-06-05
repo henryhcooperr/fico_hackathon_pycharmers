@@ -2,8 +2,9 @@ import pickle
 import pandas as pd
 import requests
 import re
+import json
 
-with open("credit_optimizer_model 1.pkl", "rb") as f:
+with open("credit_optimizer_model.pkl", "rb") as f:
     model_data = pickle.load(f)
 
 preprocessor = model_data["preprocessor"]
@@ -21,22 +22,84 @@ conversation_history = [
 ]
 
 def ask_llama(prompt):
-    conversation_history.append({"role": "user", "content": prompt})
-    url = "http://localhost:8011/api/chat"
+    """Fixed version using the generate endpoint which is more reliable"""
+    
+    # Build conversation context
+    full_prompt = ""
+    
+    # Add conversation history to prompt
+    for msg in conversation_history[-5:]:  # Last 5 messages for context
+        if msg["role"] == "system":
+            full_prompt += f"System: {msg['content']}\n\n"
+        elif msg["role"] == "user":
+            full_prompt += f"User: {msg['content']}\n"
+        elif msg["role"] == "assistant":
+            full_prompt += f"Assistant: {msg['content']}\n"
+    
+    # Add current prompt
+    full_prompt += f"User: {prompt}\nAssistant: "
+    
+    # Use the generate endpoint instead of chat
+    url = "http://localhost:11434/api/generate"
     headers = {"Content-Type": "application/json"}
     payload = {
-        "model": "llama3",
-        "messages": conversation_history,
-        "stream": False
+        "model": "llama3:latest",
+        "prompt": full_prompt,
+        "stream": False,
+        "options": {
+            "temperature": 0.7,
+            "num_predict": 500
+        }
     }
+    
     try:
-        response = requests.post(url, headers=headers, json=payload)
+        response = requests.post(url, headers=headers, json=payload, timeout=60)
         response.raise_for_status()
-        reply = response.json()["choices"][0]["message"]["content"].strip()
+        
+        # Parse the response
+        result = response.json()
+        
+        # Extract the generated text
+        if "response" in result:
+            reply = result["response"].strip()
+        else:
+            reply = "I couldn't understand the response format."
+            
+        # Update conversation history
+        conversation_history.append({"role": "user", "content": prompt})
         conversation_history.append({"role": "assistant", "content": reply})
+        
         return reply
-    except Exception:
-        return "LLaMA error: unable to connect to server."
+        
+    except requests.exceptions.ConnectionError:
+        return "Error: Cannot connect to Ollama. Make sure it's running (ollama serve)."
+    except requests.exceptions.HTTPError as e:
+        return f"HTTP Error: {e}. The generate endpoint should work with llama3:latest."
+    except requests.exceptions.Timeout:
+        return "Error: Request timed out. Try a shorter prompt or check if Ollama is responding."
+    except Exception as e:
+        return f"Error: {str(e)}"
+
+def test_ollama_connection():
+    """Test if Ollama is running and accessible"""
+    try:
+        response = requests.get("http://localhost:11434/api/tags", timeout=5)
+        if response.status_code == 200:
+            models = response.json().get("models", [])
+            if models:
+                print("✅ Ollama is running. Available models:")
+                for model in models:
+                    print(f"   - {model['name']}")
+                return True
+            else:
+                print("⚠️  Ollama is running but no models are installed.")
+                print("   Run: ollama pull llama3.2")
+                return False
+        return False
+    except:
+        print("❌ Cannot connect to Ollama. Make sure it's running:")
+        print("   Run: ollama serve")
+        return False
 
 def extract_number(text, field_name=None):
     text = text.lower().strip()
@@ -80,82 +143,158 @@ field_questions = {
     "Total_EMI_per_month": "How much do you pay monthly on all loans and credit cards combined?",
     "Num_Credit_Inquiries": "How many times have you applied for credit in the last year?",
     "Num_Credit_Card": "How many credit cards do you actively use?",
-    "Monthly_Balance": "How much do you usually owe monthly across all accounts?",
+    "Monthly_Balance": "How much do you usually have in your bank account on average?",
     "Annual_Income": "What is your total yearly income before taxes?",
     "Amount_invested_monthly": "How much money do you usually save or invest monthly?"
 }
 
 def run_credit_optimizer(user_data):
-    print("\nAnalyzing your responses...\n")
-    X_input = preprocessor.transform(pd.DataFrame([user_data]))
+    print("\n🔍 Analyzing your responses...\n")
+    
+    # Fill in missing values with defaults
+    defaults = {
+        'Age': 30,
+        'Monthly_Inhand_Salary': user_data.get('Annual_Income', 50000) / 12,
+        'Num_Bank_Accounts': 2,
+        'Interest_Rate': 15,
+        'Num_of_Loan': 1,
+        'Delay_from_due_date': 5,
+        'Changed_Credit_Limit': 2,
+        'Credit_Mix': 'Standard',
+        'Payment_of_Min_Amount': 'No',
+        'Payment_Behaviour': 'Low_spent_Small_value_payments',
+        'Type_of_Loan': 'Auto Loan, Credit-Builder Loan'
+    }
+    
+    # Merge user data with defaults
+    complete_data = {**defaults, **user_data}
+    
+    # Predict score
+    X_input = preprocessor.transform(pd.DataFrame([complete_data]))
     prediction = score_model.predict(X_input)[0]
-    print(f"Estimated Credit Score: {int(prediction)}")
+    
+    print(f"📊 Estimated Credit Score: {int(prediction)}")
+    
+    # Determine credit category
+    if prediction < 580:
+        category = "Poor"
+        emoji = "🔴"
+    elif prediction < 670:
+        category = "Fair"
+        emoji = "🟡"
+    elif prediction < 740:
+        category = "Good"
+        emoji = "🟢"
+    elif prediction < 800:
+        category = "Very Good"
+        emoji = "💚"
+    else:
+        category = "Excellent"
+        emoji = "🌟"
+    
+    print(f"   Category: {emoji} {category}\n")
 
-    print("\nBasic Tips:")
-    print(ask_llama(
-        f"The user has this credit profile: {user_data}. Their estimated credit score is {int(prediction)}. "
-        f"List 3 basic ways they can improve their credit score. Be friendly and clear."
-    ))
+    print("💡 Basic Tips:")
+    tips_prompt = (
+        f"The user has a credit score of {int(prediction)} ({category}). "
+        f"Their credit utilization is {user_data.get('Credit_Utilization_Ratio', 0)*100:.0f}%, "
+        f"they've had {user_data.get('Num_of_Delayed_Payment', 0)} late payments, "
+        f"and owe ${user_data.get('Outstanding_Debt', 0):,.0f}. "
+        f"Give 3 specific, actionable tips to improve their credit score. Be friendly and encouraging."
+    )
+    print(ask_llama(tips_prompt))
 
-    more = input("\nWould you like more advanced financial tips? (yes/no): ").strip().lower()
+    more = input("\n🎯 Would you like more advanced financial tips? (yes/no): ").strip().lower()
     if more in ["yes", "y"]:
+        # Reset conversation for focused advice
         conversation_history.clear()
         conversation_history.append({
             "role": "system",
-            "content": (
-                "You are a helpful financial assistant. Based on the user's credit profile and score, give 3 specific advanced personal finance tips. "
-                "Do NOT ask the user any questions — just provide guidance."
-            )
+            "content": "You are an expert financial advisor. Provide specific, advanced strategies based on the user's profile."
         })
-        print("\nAdvanced Tips:")
-        print(ask_llama(
-            f"The user has this credit profile: {user_data}. Their estimated score is {int(prediction)}. "
-            f"Provide 3 advanced financial strategies tailored to this profile."
-        ))
-    else:
-        print("Thank you. Wishing you financial success!")
-
-    explain_score(user_data)
         
-def explain_score(user_data):
-    print("\nFeatures Impact on Your Score:")
+        print("\n🚀 Advanced Strategies:")
+        advanced_prompt = (
+            f"Based on this profile: Score {int(prediction)}, "
+            f"Income ${user_data.get('Annual_Income', 0):,}/year, "
+            f"Debt ${user_data.get('Outstanding_Debt', 0):,}, "
+            f"Monthly payments ${user_data.get('Total_EMI_per_month', 0):,}, "
+            f"{user_data.get('Num_Credit_Card', 0)} credit cards. "
+            f"Provide 3 advanced financial strategies like debt consolidation, balance transfers, "
+            f"credit limit optimization, or investment strategies."
+        )
+        print(ask_llama(advanced_prompt))
+    
+    print("\n" + "="*60)
+    explain_score(user_data, complete_data, prediction)
+        
+def explain_score(user_data, complete_data, prediction):
+    print("📈 How Each Factor Affects Your Score:\n")
 
- 
-    defaults = {key: 0 for key in user_data}
-    X_base = preprocessor.transform(pd.DataFrame([defaults]))
+    # Create baseline with all zeros/defaults
+    baseline = {key: 0 for key in complete_data}
+    baseline.update({
+        'Credit_Mix': 'Standard',
+        'Payment_of_Min_Amount': 'No',
+        'Payment_Behaviour': 'Low_spent_Small_value_payments',
+        'Type_of_Loan': 'No Data'
+    })
+    
+    X_base = preprocessor.transform(pd.DataFrame([baseline]))
     base_score = score_model.predict(X_base)[0]
 
-    total = 0.0
-
+    impacts = []
+    
     for field in user_data:
-        modified = defaults.copy()
-        modified[field] = user_data[field]
-        X_mod = preprocessor.transform(pd.DataFrame([modified]))
-        mod_score = score_model.predict(X_mod)[0]
-
-        delta = mod_score - base_score
-        total += delta
-        direction = "increased" if delta > 0 else "decreased" if delta < 0 else "had no effect on"
-        print(f"- {field.replace('_',' ')} {direction} your score by {abs(delta):.1f} points")
-
-    print(f"\nTotal predicted score: {int(base_score + total)}")
-
-
+        if field in ['Annual_Income', 'Credit_Utilization_Ratio', 'Num_of_Delayed_Payment', 
+                    'Outstanding_Debt', 'Num_Credit_Inquiries', 'Total_EMI_per_month']:
+            modified = baseline.copy()
+            modified[field] = complete_data[field]
+            if field == 'Annual_Income':
+                modified['Monthly_Inhand_Salary'] = complete_data[field] / 12
+                
+            X_mod = preprocessor.transform(pd.DataFrame([modified]))
+            mod_score = score_model.predict(X_mod)[0]
+            
+            delta = mod_score - base_score
+            impacts.append((field, delta))
+    
+    # Sort by absolute impact
+    impacts.sort(key=lambda x: abs(x[1]), reverse=True)
+    
+    for field, delta in impacts:
+        if abs(delta) > 0.1:
+            if delta > 0:
+                print(f"✅ {field.replace('_',' ').title()}: +{delta:.1f} points")
+            else:
+                print(f"❌ {field.replace('_',' ').title()}: {delta:.1f} points")
+    
+    print(f"\n📊 Total Score Breakdown:")
+    print(f"   Base Score: {int(base_score)}")
+    print(f"   Your Factors: {int(sum(i[1] for i in impacts))}")
+    print(f"   Final Score: {int(prediction)}")
 
 def main():
-    print("\nWelcome to the Fico Buddy Credit Score Assistant!")
-    print("Answer a few friendly questions to get a credit score estimate.")
+    print("\n🎯 Welcome to the Fico Buddy Credit Score Assistant!")
+    print("="*50)
+    
+    # Test Ollama connection first
+    if not test_ollama_connection():
+        print("\n⚠️  Continuing without AI assistance...")
+        print("You'll still get your credit score estimate!\n")
+    
+    print("\nAnswer a few friendly questions to get a credit score estimate.")
     print("Type 'skip' to skip or 'exit' to quit.\n")
 
     user_data = {}
     for field, question in field_questions.items():
         retry = 0
         while retry < 2:
-            print(f"\n{question}")
+            print(f"\n❓ {question}")
             user_input = input("You: ").strip()
 
             if user_input.lower() in ["exit", "quit"]:
-                print("Goodbye!")
+                print("👋 Goodbye! Thanks for using Fico Buddy!")
                 return
             if user_input.lower() in ["skip", "s"]:
                 break
@@ -163,19 +302,21 @@ def main():
             val = extract_number(user_input, field_name=field)
             if val is not None:
                 user_data[field] = val
+                print(f"✓ Got it: {val}")
                 break
             else:
                 retry += 1
                 if retry == 1:
-                    clarification = ask_llama(f"Can you rephrase this question for someone who didn't understand: '{question}'")
-                    print(f"\n{clarification}")
+                    print("🤔 I didn't quite catch that. Could you enter a number?")
+                    print(f"   (Examples: 30%, $5000, 3 times)")
                 else:
-                    print("Skipping this one.")
+                    print("   Skipping this question.")
 
     if len(user_data) >= 5:
         run_credit_optimizer(user_data)
     else:
-        print("Not enough responses to make a prediction.")
+        print("\n⚠️  Not enough responses to make an accurate prediction.")
+        print("Please answer at least 5 questions for a credit score estimate.")
 
 if __name__ == "__main__":
     main()
