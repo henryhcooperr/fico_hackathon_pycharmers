@@ -8,6 +8,7 @@ from flask_cors import CORS
 import subprocess
 import time
 import json
+from collections import OrderedDict
 
 with open("credit_optimizer_model.pkl", "rb") as f:
     model_data = pickle.load(f)
@@ -22,6 +23,7 @@ conversation_history = [
         "content": (
             "You are a friendly credit assistant. Ask one simple, human question at a time to help estimate a user's credit score. "
             "If the user seems confused, rephrase your question simply. Never assume or answer yourself. Wait for user input."
+            "Always aim for numeric answers (like amounts, percentages, vounts, or years). Neer skip details."
         )
     }
 ]
@@ -40,19 +42,119 @@ def ask_llama(prompt):
         "messages": safe_history,
         "stream": False
     }
+
     try:
         response = requests.post(url, headers=headers, json=payload)
         response.raise_for_status()
         json_response = response.json()
 
         reply = json_response.get("choices", [{}])[0].get("message", {}).get("content", "").strip()
+
+        banned_phrases = [
+            "buy a house", "buy property", "invest in", "buy stocks", "buy shares",
+            "purchase real estate", "real estate investment", "flip houses",
+            "bitcoin", "crypto", "ethereum", "dogecoin", "nft", "forex trading",
+            "options trading", "day trading", "penny stocks", "short selling",
+            "invest in mcdonald", "invest in apple", "invest in tesla", "buy tesla", "buy amazon stock",
+            "fake documents", "falsify income", "dispute all collections", "skip payments",
+            "use someone else's credit", "open fake account", "hack", "scam", "fraud",
+            "payday loan", "title loan", "borrow from loan shark", "use cash advance",
+            "hide income", "evade taxes", "offshore account", "fake deduction"
+        ]
+
+        if any(phrase in reply.lower() for phrase in banned_phrases):
+            reply = "⚠️ Sorry, I can't give specific investment or real estate advice. For personalized financial planning, please consult a licensed professional."
+
         if reply:
             conversation_history.append({"role": "assistant", "content": reply})
             return reply
         else:
             return "LLaMA responded but gave no message."
-    except Exception as e:
+
+    except Exception as e:  
         return f"LLaMA error: {str(e)}"
+
+def classify_user_input(question_text, user_input):
+    """Use LLaMA to classify whether this is an answer, question, or neither."""
+    prompt = (
+        f"You asked: '{question_text}'\n"
+        f"The user replied: '{user_input}'\n"
+        "Is this an Answer, a Question, or Neither? Respond with one word."
+    )
+    response = ask_llama(prompt)
+    return response.lower().strip()
+
+def get_human_question(field, default_prompt):
+    """Ask LLaMA to reword this fixed question only."""
+    prompt = (
+        f"You are a helpful assistant trying to estimate a user's credit score.\n"
+        f"You must ask about this field ONLY: '{field}'.\n"
+        f"Here is the original form question: '{default_prompt}'.\n"
+        f"Please rewrite it to sound more natural and conversational.\n"
+        f"Ask ONE question only. Do NOT change the meaning."
+    )
+    return ask_llama(prompt)
+
+
+
+def run_field_collection():
+    print("\n🎯 Let's build your credit profile. Type 'skip' to skip or 'exit' to quit.")
+    user_data = {}
+    user_questions = []
+    total_fields = len(field_questions)
+
+
+    for i, (field, original_question) in enumerate(field_questions.items(), start=1):
+        attempts = 0
+        clarification = None
+
+
+        while attempts < 3:
+            print(f"\n📌 Question {i} of {total_fields}")
+            human_question = get_human_question(field, original_question)
+            print(f"LLaMA: {human_question}")
+            user_input = input("You: ").strip()
+
+
+            if user_input.lower() in ["exit", "quit"]:
+                print("👋 Exiting early. Thanks for using FicoBuddy!")
+                return user_data, user_questions
+
+
+            if user_input.lower() in ["skip", "s"]:
+                print("⏭️ Skipping this one.")
+                break
+
+
+            classification = classify_user_input(human_question, user_input)
+
+
+            if classification == "answer":
+                val = extract_clarified_number(user_input, field, clarification)
+
+
+                if val is not None:
+                    user_data[field] = val
+                    print(f"✅ Got it: {val}")
+                    break
+                else:
+                    # Try to clarify with LLaMA
+                    clarification = ask_llama(
+                        f"The user said: '{user_input}' in response to: '{human_question}'. "
+                        f"Did they mean a number? Suggest a corrected version."
+                    )
+                    print(f"🤖 LLaMA: {clarification}")
+            elif classification == "question":
+                user_questions.append(user_input)
+                print("📝 Saved your question — we'll answer it after this.")
+            else:
+                print("⚠️ That didn’t seem helpful. Try a number like 10%, $5000, or 3 times.")
+
+
+            attempts += 1
+
+
+    return user_data, user_questions
 
 def test_ollama_connection():
     try:
@@ -108,7 +210,17 @@ def extract_number(text, field_name=None):
         return float(numbers[0])
     return None
 
-field_questions = {
+def extract_clarified_number(original_input, field_name, clarification_reply):
+    """If clarification contains a corrected value (e.g. 25 years), extract that instead of 'yes'."""
+    if clarification_reply and original_input.lower() in ["yes", "yeah", "yep", "correct"]:
+        return extract_number(clarification_reply, field_name=field_name)
+    return extract_number(original_input, field_name=field_name)
+
+
+from collections import OrderedDict
+
+
+field_questions = OrderedDict({
     "Credit_Utilization_Ratio": "What percent of your available credit are you currently using? (e.g., 10%, 30%)",
     "Num_of_Delayed_Payment": "Roughly how many times have you missed a payment in the past?",
     "Credit_History_Age": "How many years have you had any form of credit like loans or credit cards?",
@@ -119,11 +231,22 @@ field_questions = {
     "Monthly_Balance": "How much do you usually have in your bank account on average?",
     "Annual_Income": "What is your total yearly income before taxes?",
     "Amount_invested_monthly": "How much money do you usually save or invest monthly?"
+})
+
+ordered_fields = ["name"] + list(field_questions.keys())
+
+chat_state = {
+    "current_index": 0,
+    "user_data": {},
+    "user_questions": [],
+    "clarification": None
 }
 
 def run_credit_optimizer(user_data):
     print("\n🔍 Analyzing your responses...\n")
-        defaults = {
+    
+    # Fill in missing values with defaults
+    defaults = {
         'Age': 30,
         'Monthly_Inhand_Salary': user_data.get('Annual_Income', 50000) / 12,
         'Num_Bank_Accounts': 2,
@@ -165,39 +288,59 @@ def run_credit_optimizer(user_data):
     
     print(f"   Category: {emoji} {category}\n")
 
-    print("💡 Basic Tips:")
     tips_prompt = (
-        f"The user has a credit score of {int(prediction)} ({category}). "
-        f"Their credit utilization is {user_data.get('Credit_Utilization_Ratio', 0)*100:.0f}%, "
-        f"they've had {user_data.get('Num_of_Delayed_Payment', 0)} late payments, "
-        f"and owe ${user_data.get('Outstanding_Debt', 0):,.0f}. "
-        f"Give 3 specific, actionable tips to improve their credit score. Be friendly and encouraging."
-    )
+    f"The user has a credit score of {int(prediction)} ({category}). "
+    f"Their credit utilization is {user_data.get('Credit_Utilization_Ratio', 0)*100:.0f}%, "
+    f"they've had {user_data.get('Num_of_Delayed_Payment', 0)} late payments, "
+    f"and owe ${user_data.get('Outstanding_Debt', 0):,.0f}. "
+    f"Give 3 specific, actionable tips to improve their credit score. Be friendly and encouraging."
+)
     print(ask_llama(tips_prompt))
 
-    more = input("\n🎯 Would you like more advanced financial tips? (yes/no): ").strip().lower()
+    more = input("\n🎯 Would you like more advanced financial tips? (yes/no): ")
+
+
     if more in ["yes", "y"]:
-        # Reset conversation for focused advice
-        conversation_history.clear()
         conversation_history.append({
             "role": "system",
-            "content": "You are an expert financial advisor. Provide specific, advanced strategies based on the user's profile."
+            "content": (
+                "You are a cautious, helpful financial advisor. "
+                "Give general, non-specific financial strategies to improve credit and money habits. "
+                "Never suggest buying specific stocks, real estate, or name-brand investments. "
+                "Avoid regulated financial advice or anything that could be construed as investment advice. "
+                "Focus on safe, educational, actionable guidance."
+            )
         })
-        
-        print("\nAdvanced Strategies:")
-        advanced_prompt = (
-            f"Based on this profile: Score {int(prediction)}, "
-            f"Income ${user_data.get('Annual_Income', 0):,}/year, "
-            f"Debt ${user_data.get('Outstanding_Debt', 0):,}, "
-            f"Monthly payments ${user_data.get('Total_EMI_per_month', 0):,}, "
-            f"{user_data.get('Num_Credit_Card', 0)} credit cards. "
-            f"Provide 3 advanced financial strategies like debt consolidation, balance transfers, "
-            f"credit limit optimization, or investment strategies."
-        )
-        print(ask_llama(advanced_prompt))
+
+    print("\nAdvanced Strategies:")
+    advanced_prompt = (
+        f"Based on this profile: Score {int(prediction)}, "
+        f"Income ${user_data.get('Annual_Income', 0):,}/year, "
+        f"Debt ${user_data.get('Outstanding_Debt', 0):,}, "
+        f"Monthly payments ${user_data.get('Total_EMI_per_month', 0):,}, "
+        f"{user_data.get('Num_Credit_Card', 0)} credit cards. "
+        f"Provide 3 advanced financial strategies like debt consolidation, balance transfers, "
+        f"credit limit optimization, or investment strategies."
+    )
+    print(ask_llama(advanced_prompt))
+
     
     print("\n" + "="*60)
     explain_score(user_data, complete_data, prediction)
+
+    print("\n💬 You can now ask me anything about your credit score, finances, or how to improve.")
+    print("Type 'exit' to finish the session.\n")
+
+    while True:
+        follow_up = input("You: ").strip()
+        if follow_up.lower() in ["exit", "quit"]:
+            print("👋 Goodbye! Thanks for using FicoBuddy!")
+            return
+        break
+    reply = ask_llama(follow_up)
+    print(f"LLaMA: {reply}\n")
+
+
         
 def explain_score(user_data, complete_data, prediction):
     print("📈 How Each Factor Affects Your Score:\n")
@@ -246,40 +389,34 @@ def explain_score(user_data, complete_data, prediction):
 
 def main():
     print("\n🎯 Welcome to the FicoBuddy Credit Score Assistant!")
-    print("="*50)
-    
-    if not test_ollama_connection():
-        print("\n⚠️  Continuing without AI assistance...")
-        print("You'll still get your credit score estimate!\n")
-    
-    print("\nAnswer a few friendly questions to get a credit score estimate.")
-    print("Type 'skip' to skip or 'exit' to quit.\n")
+    print("=" * 50)
 
-    user_data = {}
-    for field, question in field_questions.items():
-        retry = 0
-        while retry < 2:
-            print(f"\n❓ {question}")
-            user_input = input("You: ").strip()
 
-            if user_input.lower() in ["exit", "quit"]:
-                print("👋 Goodbye! Thanks for using Fico Buddy!")
-                return
-            if user_input.lower() in ["skip", "s"]:
-                break
+    user_name = input("👋 Before we begin, what's your name? ").strip().title()
+    print(f"\nNice to meet you, {user_name}! Let's get started.")
 
-            val = extract_number(user_input, field_name=field)
-            if val is not None:
-                user_data[field] = val
-                print(f"✓ Got it: {val}")
-                break
-            else:
-                retry += 1
-                if retry == 1:
-                    print("🤔 I didn't quite catch that. Could you enter a number?")
-                    print(f"   (Examples: 30%, $5000, 3 times)")
-                else:
-                    print("   Skipping this question.")
+
+    conversation_history.insert(1, {
+        "role": "user",
+        "content": f"My name is {user_name}."
+    })
+
+    user_data, user_questions = run_field_collection()
+
+
+    # Run the model
+    if len(user_data) >= 5:
+        run_credit_optimizer(user_data)
+    else:
+        print("\n⚠️ Not enough valid answers to estimate your credit score.")
+
+
+    # Answer follow-up user questions
+    if user_questions:
+        print("\n You asked some good questions. Let’s review them now:\n")
+        for q in user_questions:
+            print(f"❓ {q}")
+            print("💬", ask_llama(q))
 
     if len(user_data) >= 5:
         run_credit_optimizer(user_data)
@@ -306,24 +443,137 @@ if __name__ == "__main__":
         from flask_cors import CORS
 
         app = Flask(__name__)
-        CORS(app, origins=["http://localhost:59824"])
+        CORS(app, origins=[
+            "http://localhost:59824",
+            "http://localhost:4200"
+        ])
 
         @app.route("/api/chat", methods=["GET", "POST"])
         def chat_endpoint():
-            if request.method == "GET":
-                return jsonify({"message": "Chat endpoint is alive!"})
+            try:
+                # ✅ GET request: health check or frontend ping
+                if request.method == "GET":
+                    return ('', 204)  # No Content — silent success
 
-            if request.method == "POST":
+
+                # ✅ POST request: main chat logic
                 data = request.get_json()
-                user_message = data.get("message")
-                if not user_message:
-                    return jsonify({"error": "Missing 'message' in request body"}), 400
-                ai_reply = ask_llama(user_message)
-                return jsonify({"response": ai_reply})
+                user_message = data.get("message", "").strip()
 
-        start_ngrok() 
+
+                if not user_message:
+                    return jsonify({"error": "Missing 'message'"}), 400
+
+
+                if user_message.lower() in ["__start__", "hello", "hi", "hey", "start"]:
+                    chat_state["current_index"] = 0
+                    chat_state["user_data"] = {}
+                    chat_state["user_questions"] = []
+                    chat_state["clarification"] = None
+
+                    return jsonify({
+                        "response": "👋 Hello! I'm FicoBuddy, your credit assistant.\n\nWhat's your first name?",
+                        "showRecommendations": False
+                    })
+
+
+                i = chat_state["current_index"]
+                if i >= len(ordered_fields):
+                    return jsonify({
+                        "response": "✅ We're done collecting info! Ready to estimate your credit score.",
+                        "showRecommendations": True
+                    })
+
+
+                field = ordered_fields[i]
+                if field == "name":
+                    if len(user_message) < 2 or not user_message.replace(" ", "").isalpha():
+                        return jsonify({
+                            "response": "👋 Please enter just your first name (letters only).",
+                            "showRecommendations": False
+                        })
+
+
+                    chat_state["user_data"]["name"] = user_message.title()
+                    chat_state["current_index"] += 1
+                    next_field = ordered_fields[chat_state["current_index"]]
+                    next_q = get_human_question(next_field, field_questions[next_field])
+                    return jsonify({
+                        "response": f"Nice to meet you, {user_message.title()}! {next_q}",
+                        "showRecommendations": False
+                    })
+
+                original_q = field_questions[field]
+                classification = classify_user_input(original_q, user_message)
+
+
+                if classification == "answer":
+                    val = extract_clarified_number(user_message, field, chat_state["clarification"])
+                    if val is not None:
+                        chat_state["user_data"][field] = val
+                        chat_state["current_index"] += 1
+                        chat_state["clarification"] = None
+
+
+                        # ✅ This block ensures progression
+                        if chat_state["current_index"] < len(ordered_fields):
+                            next_field = ordered_fields[chat_state["current_index"]]
+                            next_q = get_human_question(next_field, field_questions[next_field])
+                            return jsonify({
+                                "response": next_q,
+                                "showRecommendations": False
+                            })
+                        else:
+                            return jsonify({
+                                "response": "✅ Done! I have everything I need to calculate your credit score.",
+                                "showRecommendations": True
+                            })
+
+
+                    else:
+                        chat_state["clarification"] = ask_llama(
+                            f"The user said: '{user_message}' in response to: '{original_q}'. "
+                            f"Did they mean a number? Suggest a corrected version."
+                        )
+                        return jsonify({
+                            "response": f"🤖 Just to clarify — did you mean: {chat_state['clarification']}?",
+                            "showRecommendations": False
+                        })
+
+
+                elif classification == "question":
+                    chat_state["user_questions"].append(user_message)
+                    return jsonify({
+                        "response": "📝 Got your question! I'll answer it after we finish your profile.",
+                        "showRecommendations": False
+                    })
+
+
+                else:
+                    return jsonify({
+                        "response": "⚠️ Hmm, that didn't look like a number. Try something like 10%, $5000, or 3 times.",
+                        "showRecommendations": False
+                    })
+
+
+                if chat_state["current_index"] < len(ordered_fields):
+                    next_field = ordered_fields[chat_state["current_index"]]
+                    next_q = get_human_question(next_field, field_questions[next_field])
+                    return jsonify({
+                        "response": next_q,
+                        "showRecommendations": False
+                    })
+                else:
+                    return jsonify({
+                        "response": "✅ Done! I have everything I need to calculate your credit score.",
+                        "showRecommendations": True
+                    })
+
+
+            except Exception as e:
+                return jsonify({"error": str(e)}), 500
+
+        start_ngrok()
         app.run(port=5000)
     else:
         main()
-
-
