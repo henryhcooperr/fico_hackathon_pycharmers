@@ -1,3 +1,5 @@
+from credit_score_optimizer import DataPreprocessor, CreditScoreOptimizer
+import pickle
 import pickle
 import pandas as pd
 import requests
@@ -10,7 +12,7 @@ import time
 import json
 from collections import OrderedDict
 
-with open("credit_optimizer_model.pkl", "rb") as f:
+with open("credit_optimizer_model2.pkl", "rb") as f:
     model_data = pickle.load(f)
 
 preprocessor = model_data["preprocessor"]
@@ -75,7 +77,9 @@ def ask_llama(prompt):
         return f"LLaMA error: {str(e)}"
 
 def classify_user_input(question_text, user_input):
-    """Use LLaMA to classify whether this is an answer, question, or neither."""
+    # If the user input looks like a number, treat it as an answer
+    if re.search(r'\d', user_input):
+        return "answer"
     prompt = (
         f"You asked: '{question_text}'\n"
         f"The user replied: '{user_input}'\n"
@@ -177,37 +181,45 @@ def test_ollama_connection():
         return False
 
 def extract_number(text, field_name=None):
+    print(f"[extract_number] text='{text}', field_name='{field_name}'")
     text = text.lower().strip()
 
+    # handle percentages
     if field_name == "Credit_Utilization_Ratio":
-        percent_match = re.search(r'(\d+\.?\d*)\s*(?:%|percent)', text)
+        percent_match = re.search(r'(\d+\.?\d*)\s*(%|percent)?', text)
         if percent_match:
             val = float(percent_match.group(1))
             return val / 100 if val > 1 else val
-        if re.fullmatch(r'\d+', text):
-            val = float(text)
-            return val / 100 if val > 1 else val
 
+    # handle delayed payments / inquiries
     if field_name in ["Num_of_Delayed_Payment", "Num_Credit_Inquiries"]:
         if any(word in text for word in ["no", "none", "zero", "never", "0"]):
             return 0.0
-        if "once" in text or "one" in text or "1" in text:
+        if any(word in text for word in ["once", "one", "1"]):
             return 1.0
-        if "twice" in text or "two" in text or "2" in text:
+        if any(word in text for word in ["twice", "two", "2"]):
             return 2.0
         if "few" in text:
             return 3.0
 
-    text_clean = text.replace("$", "").replace(",", "")
-    k_match = re.search(r'(\d+\.?\d*)\s*(?:k|thousand)', text_clean, re.IGNORECASE)
+    # handle credit history age
+    if field_name == "Credit_History_Age":
+        age_match = re.search(r'(\d+\.?\d*)\s*(years|yrs|year)?', text)
+        if age_match:
+            return float(age_match.group(1))
+
+    # handle $ amounts, "5k", "1.2 million", etc.
+    text_clean = text.replace("$", "").replace(",", "").replace("usd", "")
+    k_match = re.search(r'(\d+\.?\d*)\s*(k|thousand)', text_clean)
     if k_match:
         return float(k_match.group(1)) * 1000
-    m_match = re.search(r'(\d+\.?\d*)\s*(?:m|million)', text_clean, re.IGNORECASE)
+    m_match = re.search(r'(\d+\.?\d*)\s*(m|million)', text_clean)
     if m_match:
-        return float(m_match.group(1)) * 1000000
-    numbers = re.findall(r'\d+\.?\d*', text_clean)
-    if numbers:
-        return float(numbers[0])
+        return float(m_match.group(1)) * 1_000_000
+    number_match = re.findall(r'\d+\.?\d*', text_clean)
+    if number_match:
+        return float(number_match[0])
+
     return None
 
 def extract_clarified_number(original_input, field_name, clarification_reply):
@@ -451,12 +463,9 @@ if __name__ == "__main__":
         @app.route("/api/chat", methods=["GET", "POST"])
         def chat_endpoint():
             try:
-                # ✅ GET request: health check or frontend ping
                 if request.method == "GET":
                     return ('', 204)  # No Content — silent success
 
-
-                # ✅ POST request: main chat logic
                 data = request.get_json()
                 user_message = data.get("message", "").strip()
 
@@ -479,11 +488,12 @@ if __name__ == "__main__":
 
                 i = chat_state["current_index"]
                 if i >= len(ordered_fields):
+                    score, category, tips = process_user_data(chat_state["user_data"])
                     return jsonify({
-                        "response": "✅ We're done collecting info! Ready to estimate your credit score.",
-                        "showRecommendations": True
+                        "response": f"📊 Your estimated credit score is **{score}** ({category}).\n\nTips: {tips}",
+                        "showRecommendations": True,
+                        "continueChat": True
                     })
-
 
                 field = ordered_fields[i]
                 if field == "name":
@@ -493,19 +503,25 @@ if __name__ == "__main__":
                             "showRecommendations": False
                         })
 
-
                     chat_state["user_data"]["name"] = user_message.title()
                     chat_state["current_index"] += 1
-                    next_field = ordered_fields[chat_state["current_index"]]
-                    next_q = get_human_question(next_field, field_questions[next_field])
-                    return jsonify({
-                        "response": f"Nice to meet you, {user_message.title()}! {next_q}",
-                        "showRecommendations": False
-                    })
+                    if chat_state["current_index"] < len(ordered_fields):
+                        next_field = ordered_fields[chat_state["current_index"]]
+                        next_q = get_human_question(next_field, field_questions[next_field])
+                        return jsonify({
+                            "response": f"Nice to meet you, {user_message.title()}! {next_q}",
+                            "showRecommendations": False
+                        })
+                    else:
+                        # Immediately calculate and show the score and tips in chat
+                        score, category, tips = process_user_data(chat_state["user_data"])
+                        return jsonify({
+                            "response": f"📊 Your estimated credit score is **{score}** ({category}).\n\nTips: {tips}"
+                        })
 
                 original_q = field_questions[field]
                 classification = classify_user_input(original_q, user_message)
-
+                print(f"[classify_user_input] '{user_message}' classified as '{classification}'")
 
                 if classification == "answer":
                     val = extract_clarified_number(user_message, field, chat_state["clarification"])
@@ -514,8 +530,6 @@ if __name__ == "__main__":
                         chat_state["current_index"] += 1
                         chat_state["clarification"] = None
 
-
-                        # ✅ This block ensures progression
                         if chat_state["current_index"] < len(ordered_fields):
                             next_field = ordered_fields[chat_state["current_index"]]
                             next_q = get_human_question(next_field, field_questions[next_field])
@@ -524,11 +538,11 @@ if __name__ == "__main__":
                                 "showRecommendations": False
                             })
                         else:
+                            # Immediately calculate and show the score and tips in chat
+                            score, category, tips = process_user_data(chat_state["user_data"])
                             return jsonify({
-                                "response": "✅ Done! I have everything I need to calculate your credit score.",
-                                "showRecommendations": True
+                                "response": f"📊 Your estimated credit score is **{score}** ({category}).\n\nTips: {tips}"
                             })
-
 
                     else:
                         chat_state["clarification"] = ask_llama(
@@ -564,12 +578,30 @@ if __name__ == "__main__":
                         "showRecommendations": False
                     })
                 else:
+                    # Immediately calculate and show the score and tips in chat
+                    score, category, tips = process_user_data(chat_state["user_data"])
                     return jsonify({
-                        "response": "✅ Done! I have everything I need to calculate your credit score.",
-                        "showRecommendations": True
+                        "response": f"📊 Your estimated credit score is **{score}** ({category}).\n\nTips: {tips}"
                     })
 
+            except Exception as e:
+                return jsonify({"error": str(e)}), 500
 
+        @app.route("/api/score", methods=["POST"])
+        def score_endpoint():
+            try:
+                data = request.get_json()
+                if not data:
+                    return jsonify({"error": "Missing JSON body"}), 400
+
+                score, category, tips = process_user_data(data)
+
+                return jsonify({
+                    "score": int(score),
+                    "category": category,
+                    "tips": tips,
+                    "showRecommendations": True
+                })
             except Exception as e:
                 return jsonify({"error": str(e)}), 500
 
